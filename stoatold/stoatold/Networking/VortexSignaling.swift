@@ -36,8 +36,9 @@ class VortexSignaling {
     var onParticipants:   (([String]) -> Void)?
     var onConsumerReady:  ((String, String, [String: Any]) -> Void)?
     var onConnected:      (() -> Void)?   // fires when LiveKit JoinResponse arrives
-    var onSdpAnswer:      ((String, String) -> Void)?   // (type, sdp) from server
-    var onRemoteIceTrickle: ((String) -> Void)?          // candidateInit JSON from server
+    var onSdpAnswer:      ((String, String) -> Void)?   // (type, sdp) answer → our publisher offer
+    var onSdpOffer:       ((String, String) -> Void)?   // (type, sdp) server's subscriber offer
+    var onRemoteIceTrickle: ((String, Int) -> Void)?     // (candidateInit JSON, target) from server
     var onIceServersRaw:  (([IceServerEntry]) -> Void)? // ICE servers from JoinResponse
 
     // ── Private state ─────────────────────────────────────────────────────────
@@ -89,6 +90,12 @@ class VortexSignaling {
     func leave() {
         pingTimer?.invalidate(); pingTimer = nil
         if let ctx = owslCtx {
+            // Send LiveKit's Leave signal (= web client's room.disconnect()) so the
+            // server removes our participant immediately; otherwise the session lingers
+            // and the next join_call is rejected with HTTP 400.
+            if handshakeDone {
+                sendFrame(opcode: 0x2, payload: encodeSignalRequestLeave())
+            }
             owsl_close(ctx)
             let q = DispatchQueue(label: "com.stoatold.owsl.destroy")
             q.async { owsl_destroy(ctx) }
@@ -144,7 +151,8 @@ class VortexSignaling {
                   let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let tok  = json["token"] as? String,
                   let url  = json["url"]   as? String else {
-                self.onError?("join_call: no token/url (HTTP \(status))"); return
+                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? "(no body)"
+                self.onError?("join_call HTTP \(status): \(body.prefix(160))"); return
             }
             self.voiceToken = tok
             // OpenSSL supports GCM — use wss:// (TLS)
@@ -256,7 +264,7 @@ class VortexSignaling {
         handshakeDone = true
         onError?("101 OK — waiting for LiveKit response")
 
-        let t = Timer(timeInterval: 30, target: self,
+        let t = Timer(timeInterval: 10, target: self,
                       selector: #selector(sendPing), userInfo: nil, repeats: true)
         RunLoop.main.add(t, forMode: .common)
         pingTimer = t
@@ -264,7 +272,18 @@ class VortexSignaling {
         if !readBuffer.isEmpty { processFrames() }
     }
 
-    @objc private func sendPing() { sendCmd("Ping") }
+    // LiveKit (/rtc protocol 7) keeps the session alive via an application-level
+    // SignalRequest.ping; it ignores text frames, so a JSON "Ping" never resets the
+    // server's timeout and the room is torn down after ~1 min. Send a real protobuf
+    // ping as a binary frame; the server replies with pong and the session stays open.
+    @objc private func sendPing() {
+        guard handshakeDone, owslCtx != nil else { return }
+        // Send both the legacy int64 ping (field 14) and the newer Ping message
+        // (ping_req, field 16) in separate frames — different LiveKit server versions
+        // honour one or the other; whichever resets the session timeout keeps us alive.
+        sendFrame(opcode: 0x2, payload: encodeSignalRequestPing())
+        sendFrame(opcode: 0x2, payload: encodeSignalRequestPingReq())
+    }
 
     // ── Signaling helpers ─────────────────────────────────────────────────────
 
@@ -369,8 +388,20 @@ class VortexSignaling {
         sendFrame(opcode: 0x2, payload: payload)   // binary frame
     }
 
-    func sendIceTrickle(_ candidateJson: String) {
-        let payload = encodeSignalRequestTrickle(candidateJson: candidateJson)
+    func sendSdpAnswer(type: String, sdp: String) {
+        let payload = encodeSignalRequestAnswer(type: type, sdp: sdp)
+        sendFrame(opcode: 0x2, payload: payload)   // binary frame — subscriber answer
+    }
+
+    // Register the published mic track so the server marks us unmuted with a real audio source.
+    func sendAddTrack(cid: String, name: String) {
+        let payload = encodeSignalRequestAddTrack(cid: cid, name: name)
+        sendFrame(opcode: 0x2, payload: payload)   // binary frame
+    }
+
+    // target: 0 = PUBLISHER, 1 = SUBSCRIBER
+    func sendIceTrickle(_ candidateJson: String, target: Int) {
+        let payload = encodeSignalRequestTrickle(candidateJson: candidateJson, target: target)
         sendFrame(opcode: 0x2, payload: payload)   // binary frame
     }
 
@@ -521,7 +552,8 @@ class VortexSignaling {
             if wt == 2, let bytes = r.readBytes() {
                 switch field {
                 case 1: parseJoinResponse(bytes)       // JoinResponse
-                case 2: parseSessionDescAnswer(bytes)  // SessionDescription (answer)
+                case 2: parseSessionDescAnswer(bytes)  // SessionDescription answer → our publisher offer
+                case 3: parseSessionDescOffer(bytes)   // SessionDescription offer → server subscriber offer
                 case 4: parseTrickleResponse(bytes)    // TrickleRequest (ICE)
                 case 5: parseParticipantUpdate(bytes)  // ParticipantUpdate
                 default: break
@@ -587,19 +619,39 @@ class VortexSignaling {
         if !sdp.isEmpty { onSdpAnswer?(type.isEmpty ? "answer" : type, sdp) }
     }
 
-    // TrickleRequest from server: field 1 = candidateInit JSON string
-    private func parseTrickleResponse(_ data: Data) {
+    // SessionDescription offer from server (subscriber PC): field 1 = type, field 2 = sdp
+    private func parseSessionDescOffer(_ data: Data) {
         var r = ProtoReader(data)
+        var type = ""; var sdp = ""
         while r.hasMore {
             guard let (field, wt) = r.readTag() else { break }
             if wt == 2, let bytes = r.readBytes() {
-                if field == 1 {
-                    if let json = String(data: bytes, encoding: .utf8) {
-                        onRemoteIceTrickle?(json)
-                    }
+                switch field {
+                case 1: type = String(data: bytes, encoding: .utf8) ?? ""
+                case 2: sdp  = String(data: bytes, encoding: .utf8) ?? ""
+                default: break
                 }
             } else { r.skip(wireType: wt) }
         }
+        if !sdp.isEmpty { onSdpOffer?(type.isEmpty ? "offer" : type, sdp) }
+    }
+
+    // TrickleRequest from server: field 1 = candidateInit JSON, field 2 = target (0=PUB,1=SUB)
+    private func parseTrickleResponse(_ data: Data) {
+        var r = ProtoReader(data)
+        var json: String? = nil; var target = 0
+        while r.hasMore {
+            guard let (field, wt) = r.readTag() else { break }
+            switch (field, wt) {
+            case (1, 2):
+                if let b = r.readBytes() { json = String(data: b, encoding: .utf8) }
+            case (2, 0):
+                if let v = r.readVarint() { target = Int(v) }
+            default:
+                r.skip(wireType: wt)
+            }
+        }
+        if let json = json { onRemoteIceTrickle?(json, target) }
     }
 
     private func parseParticipantUpdate(_ data: Data) {
@@ -665,17 +717,55 @@ private func protoVarintField(_ fieldNo: Int, _ v: UInt64) -> [UInt8] {
     return tag + encodeVarint(v)
 }
 
-// SignalRequest { offer (field 1) = SessionDescription { type(1), sdp(2) } }
+// SignalRequest { offer (field 1) = SessionDescription { type(1), sdp(2) } } — publisher.
 private func encodeSignalRequestOffer(type: String, sdp: String) -> Data {
     let sdpMsg: [UInt8] = protoStringField(1, type) + protoStringField(2, sdp)
     return Data(protoMessageField(1, sdpMsg))
 }
 
-// SignalRequest { trickle (field 3) = TrickleRequest { candidateInit(1), target(2)=0 } }
-private func encodeSignalRequestTrickle(candidateJson: String) -> Data {
+// SignalRequest { answer (field 2) = SessionDescription { type(1), sdp(2) } } — subscriber.
+private func encodeSignalRequestAnswer(type: String, sdp: String) -> Data {
+    let sdpMsg: [UInt8] = protoStringField(1, type) + protoStringField(2, sdp)
+    return Data(protoMessageField(2, sdpMsg))
+}
+
+// SignalRequest { add_track (field 4) = AddTrackRequest {
+//   cid(1), name(2), type(3)=AUDIO(0), source(8)=MICROPHONE(2) } }
+// muted (field 6) is omitted → proto3 default false → server marks the track unmuted.
+private func encodeSignalRequestAddTrack(cid: String, name: String) -> Data {
+    var body: [UInt8] = protoStringField(1, cid) + protoStringField(2, name)
+    body += protoVarintField(3, 0)   // TrackType.AUDIO
+    body += protoVarintField(8, 2)   // TrackSource.MICROPHONE
+    return Data(protoMessageField(4, body))
+}
+
+// SignalRequest { ping (field 14, int64) = unix millis } — LiveKit keepalive (legacy).
+private func encodeSignalRequestPing() -> Data {
+    let millis = UInt64(Date().timeIntervalSince1970 * 1000)
+    return Data(protoVarintField(14, millis))
+}
+
+// SignalRequest { ping_req (field 16) = Ping { timestamp(1)=unix millis, rtt(2)=0 } } — newer.
+private func encodeSignalRequestPingReq() -> Data {
+    let millis = UInt64(Date().timeIntervalSince1970 * 1000)
+    let ping: [UInt8] = protoVarintField(1, millis) + protoVarintField(2, 0)
+    return Data(protoMessageField(16, ping))
+}
+
+// SignalRequest { trickle (field 3) = TrickleRequest { candidateInit(1), target(2) } }
+// target: 0 = PUBLISHER, 1 = SUBSCRIBER
+private func encodeSignalRequestTrickle(candidateJson: String, target: Int) -> Data {
     var trickle: [UInt8] = protoStringField(1, candidateJson)
-    trickle += protoVarintField(2, 0)   // target = PUBLISHER = 0
+    trickle += protoVarintField(2, UInt64(target))
     return Data(protoMessageField(3, trickle))
+}
+
+// SignalRequest { leave (field 8) = LeaveRequest { reason(2) = CLIENT_INITIATED(1) } }
+// Equivalent of the web client's room.disconnect() — tells the server to cleanly remove
+// our participant so a subsequent join_call doesn't 400 on a ghost session.
+private func encodeSignalRequestLeave() -> Data {
+    let leave: [UInt8] = protoVarintField(2, 1)   // DisconnectReason.CLIENT_INITIATED
+    return Data(protoMessageField(8, leave))
 }
 
 // ── Minimal protobuf binary reader ────────────────────────────────────────────

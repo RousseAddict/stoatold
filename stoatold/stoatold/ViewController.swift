@@ -8,6 +8,7 @@ class ServerListVC: UIViewController, UIAlertViewDelegate {
     private let statusLbl    = UILabel()
     private let dmsBadgeView = UIView()
     private let dmsBadgeLbl  = UILabel()
+    private let refresh      = UIRefreshControl()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -125,6 +126,14 @@ class ServerListVC: UIViewController, UIAlertViewDelegate {
         tableView.delegate   = self
         tableView.register(ServerCell.self, forCellReuseIdentifier: "srv")
         tableView.isHidden = true
+
+        // Pull-to-refresh — re-syncs the server list (e.g. after joining a new server
+        // elsewhere). UIRefreshControl is iOS 6+; on a plain UIViewController it must be
+        // added as a subview of the table rather than via tableView.refreshControl.
+        refresh.tintColor = UIColor(white: 0.7, alpha: 1)
+        refresh.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
+        tableView.addSubview(refresh)
+
         view.addSubview(tableView)
     }
 
@@ -140,6 +149,7 @@ class ServerListVC: UIViewController, UIAlertViewDelegate {
             StoatDebug.log("serverlist: onReady block entered")
             guard let self = self else { StoatDebug.log("serverlist: self nil"); return }
             self.hasBeenReady = true
+            self.refresh.endRefreshing()
             self.statusLbl.text = "onReady: \(StoatSocket.shared.servers.count) servers"
             StoatDebug.log("serverlist: stopping spinner")
             self.spinner.stopAnimating()
@@ -165,6 +175,21 @@ class ServerListVC: UIViewController, UIAlertViewDelegate {
 
         ws.connect(urlString: APIClient.wsURL, token: token)
     }
+
+    // Pull-to-refresh: tear the socket down and reconnect so the server emits a fresh
+    // Ready event with the up-to-date server list. onReady ends the refresh spinner.
+    @objc private func handleRefresh() {
+        let ws = StoatSocket.shared
+        guard let token = APIClient.sessionToken else { refresh.endRefreshing(); return }
+        ws.disconnect(intentional: true)
+        ws.connect(urlString: APIClient.wsURL, token: token)
+        // Safety: stop the spinner even if Ready never arrives.
+        let t = Timer(timeInterval: 8, target: self,
+                      selector: #selector(endRefreshTimeout), userInfo: nil, repeats: false)
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    @objc private func endRefreshTimeout() { refresh.endRefreshing() }
 
     // MARK: - Actions
 
@@ -206,8 +231,12 @@ private class ServerCell: UITableViewCell {
 
     private let iconView  = UIView()
     private let iconLabel = UILabel()
+    private let iconImage = UIImageView()
     private let nameLabel = UILabel()
     private let unreadDot = UIView()
+    private var currentIconId: String?
+
+    private static let iconCache = NSCache<NSString, UIImage>()
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -232,6 +261,13 @@ private class ServerCell: UITableViewCell {
         iconLabel.frame = iconView.bounds
         iconView.addSubview(iconLabel)
 
+        // Server icon image (overlays the letter placeholder once loaded)
+        iconImage.contentMode = .scaleAspectFill
+        iconImage.clipsToBounds = true
+        iconImage.frame = iconView.bounds
+        iconImage.isHidden = true
+        iconView.addSubview(iconImage)
+
         // Name
         nameLabel.backgroundColor = .clear
         nameLabel.textColor = .white
@@ -255,6 +291,35 @@ private class ServerCell: UITableViewCell {
         iconView.backgroundColor = ServerListVC.accentColor(for: server.name)
         let hasUnread = server.channelIds.contains { StoatSocket.shared.unreadChannelIds.contains($0) }
         unreadDot.isHidden = !hasUnread
+
+        // Server icon: show letter placeholder, swap in the real image when available.
+        currentIconId = server.iconId
+        iconImage.image = nil
+        iconImage.isHidden = true
+        iconLabel.isHidden = false
+        if let iconId = server.iconId, let url = server.iconURL {
+            if let cached = ServerCell.iconCache.object(forKey: iconId as NSString) {
+                iconImage.image = cached
+                iconImage.isHidden = false
+                iconLabel.isHidden = true
+            } else {
+                loadIcon(url: url, iconId: iconId)
+            }
+        }
+    }
+
+    private func loadIcon(url: String, iconId: String) {
+        // iOS 6 Secure Transport is CBC-only and the CDN requires GCM, so
+        // NSURLConnection (HTTPClient) fails the TLS handshake. Load via the
+        // OpenSSL bridge (CDNImage) which negotiates GCM.
+        CDNImage.load(url) { [weak self] img in
+            guard let img = img else { return }
+            ServerCell.iconCache.setObject(img, forKey: iconId as NSString)
+            guard let self = self, self.currentIconId == iconId else { return }
+            self.iconImage.image = img
+            self.iconImage.isHidden = false
+            self.iconLabel.isHidden = true
+        }
     }
 
     static func accentColor(for name: String) -> UIColor {

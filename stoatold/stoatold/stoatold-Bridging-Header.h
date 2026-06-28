@@ -3,5 +3,7 @@
 
 #include "Networking/openssl_ws_bridge.h"
 #import "CrashLogger.h"
+#import "RTCAudioProbe.h"
+#import "CrashTrace.h"
 
 #endif

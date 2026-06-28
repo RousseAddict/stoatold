@@ -4,12 +4,20 @@ struct StoatServer {
     let id:         String
     let name:       String
     let channelIds: [String]
+    let iconId:     String?
+
+    // autumn CDN: server icons live at {CDN}/icons/{file_id} (mirrors the web client)
+    var iconURL: String? {
+        guard let iconId = iconId else { return nil }
+        return "https://cdn.stoatusercontent.com/icons/\(iconId)"
+    }
 
     static func from(dict: [String: Any]) -> StoatServer? {
         guard let id   = dict["_id"]  as? String,
               let name = dict["name"] as? String else { return nil }
         let channelIds = dict["channels"] as? [String] ?? []
-        return StoatServer(id: id, name: name, channelIds: channelIds)
+        let iconId = (dict["icon"] as? [String: Any])?["_id"] as? String
+        return StoatServer(id: id, name: name, channelIds: channelIds, iconId: iconId)
     }
 }
 

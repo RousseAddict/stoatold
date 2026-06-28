@@ -11,7 +11,16 @@ class MembersVC: UIViewController {
     struct MemberEntry {
         let userId:   String
         let username: String
+        let nickname: String?
+        let avatarId: String?
         var relationship: String?   // "Friend" | "Incoming" | "Outgoing" | nil
+
+        // Show the server nickname when present, otherwise the username.
+        var displayName: String { return nickname ?? username }
+        var avatarURL: String? {
+            guard let avatarId = avatarId else { return nil }
+            return "https://cdn.stoatusercontent.com/avatars/\(avatarId)"
+        }
 
         var isSelf:    Bool { return userId == StoatSocket.shared.currentUser?.id }
         var isFriend:  Bool { return relationship == "Friend" }
@@ -81,8 +90,13 @@ class MembersVC: UIViewController {
 
                     let userDict  = userMap[uid] ?? [:]
                     let username  = userDict["username"] as? String ?? uid
+                    let nickname  = mem["nickname"] as? String
+                    // server member avatar takes priority over the global user avatar
+                    let avatarId  = ((mem["avatar"] as? [String: Any])?["_id"] as? String)
+                        ?? ((userDict["avatar"] as? [String: Any])?["_id"] as? String)
                     let rel       = StoatSocket.shared.allUsers[uid]?.relationship
                     entries.append(MemberEntry(userId: uid, username: username,
+                                               nickname: nickname, avatarId: avatarId,
                                                relationship: rel))
                 }
             } else if let arr = json as? [[String: Any]] {
@@ -90,8 +104,10 @@ class MembersVC: UIViewController {
                 for u in arr {
                     guard let uid = u["_id"] as? String else { continue }
                     let username = u["username"] as? String ?? uid
+                    let avatarId = (u["avatar"] as? [String: Any])?["_id"] as? String
                     let rel      = StoatSocket.shared.allUsers[uid]?.relationship
                     entries.append(MemberEntry(userId: uid, username: username,
+                                               nickname: nil, avatarId: avatarId,
                                                relationship: rel))
                 }
             }
@@ -100,7 +116,7 @@ class MembersVC: UIViewController {
             entries.sort {
                 if $0.isSelf != $1.isSelf { return $0.isSelf }
                 if $0.isFriend != $1.isFriend { return $0.isFriend }
-                return $0.username.lowercased() < $1.username.lowercased()
+                return $0.displayName.lowercased() < $1.displayName.lowercased()
             }
             self.members = entries
             self.tableView.isHidden = false
@@ -223,8 +239,10 @@ private class MemberCell: UITableViewCell {
 
     private let avatarView  = UIView()
     private let avatarLabel = UILabel()
+    private let avatarImage = UIImageView()
     private let nameLabel   = UILabel()
     private let badgeLabel  = UILabel()
+    private var currentAvatarURL: String?
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -247,6 +265,12 @@ private class MemberCell: UITableViewCell {
         avatarLabel.frame = avatarView.bounds
         avatarView.addSubview(avatarLabel)
 
+        avatarImage.contentMode   = .scaleAspectFill
+        avatarImage.clipsToBounds = true
+        avatarImage.frame         = avatarView.bounds
+        avatarImage.isHidden      = true
+        avatarView.addSubview(avatarImage)
+
         nameLabel.backgroundColor = .clear
         nameLabel.textColor = .white
         nameLabel.font = UIFont.systemFont(ofSize: 15)
@@ -264,8 +288,9 @@ private class MemberCell: UITableViewCell {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(with entry: MembersVC.MemberEntry) {
-        nameLabel.text   = entry.username
-        avatarLabel.text = String(entry.username.prefix(1)).uppercased()
+        nameLabel.text   = entry.displayName
+        avatarLabel.text = String(entry.displayName.prefix(1)).uppercased()
+        loadAvatar(entry.avatarURL)
 
         let colors: [UIColor] = [
             UIColor(red: 0.55, green: 0.27, blue: 0.87, alpha: 1),
@@ -290,6 +315,19 @@ private class MemberCell: UITableViewCell {
             badgeLabel.textColor = UIColor(red: 0.36, green: 0.56, blue: 0.90, alpha: 1)
         } else {
             badgeLabel.text = ""
+        }
+    }
+
+    private func loadAvatar(_ urlString: String?) {
+        avatarImage.image    = nil
+        avatarImage.isHidden = true
+        currentAvatarURL     = urlString
+        guard let urlString = urlString else { return }
+        CDNImage.load(urlString) { [weak self] img in
+            guard let img = img, let self = self,
+                  self.currentAvatarURL == urlString else { return }
+            self.avatarImage.image    = img
+            self.avatarImage.isHidden = false
         }
     }
 }

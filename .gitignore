@@ -9,3 +9,4 @@
 *.sw?
 .env
 
+build.sh

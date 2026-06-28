@@ -31,14 +31,10 @@ class ChatVC: UIViewController {
         super.viewDidLoad()
         title = "#\(channel.name)"
         view.backgroundColor = UIColor(red: 0.12, green: 0.12, blue: 0.16, alpha: 1)
-        navigationItem.leftBarButtonItem = UIBarButtonItem(
-            title: "< Channels", style: .plain, target: self, action: #selector(goBack))
         buildUI()
         fetchMessages()
         StoatSocket.shared.onEvent = { [weak self] json in self?.handleEvent(json) }
     }
-
-    @objc private func goBack() { navigationController?.popViewController(animated: true) }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)

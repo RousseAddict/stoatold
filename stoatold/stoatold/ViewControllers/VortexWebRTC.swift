@@ -1,13 +1,9 @@
 import UIKit
 import WebRTC
 
-/// Manages WebRTC peer connection for LiveKit voice rooms.
-/// Lifecycle:
-///   1. VortexSignaling connects and fires onIceServersRaw
-///   2. Call configure(withIceServersRaw:) then start()
-///   3. start() creates offer → sends via VortexSignaling
-///   4. VortexSignaling delivers answer → peerConnection connects
-///   5. ICE candidates flow in both directions automatically
+/// Manages the LiveKit dual-PeerConnection model for voice rooms:
+///   • publisherPC  — client creates the offer, sends the local mic track.
+///   • subscriberPC — server creates the offer, we answer; remote audio arrives here.
 class VortexWebRTC: NSObject {
 
     static let shared = VortexWebRTC()
@@ -19,10 +15,16 @@ class VortexWebRTC: NSObject {
 
     // WebRTC objects
     private var factory: RTCPeerConnectionFactory?
-    private var peerConnection: RTCPeerConnection?
+    private var publisherPC: RTCPeerConnection?
+    private var subscriberPC: RTCPeerConnection?
     private var localAudioTrack: RTCAudioTrack?
     private var iceServers: [RTCIceServer] = []
     private var isRunning = false
+    private var deafened = false
+    private var audioConnectedFired = false
+
+    private let localTrackId = "audio0"
+    private let localStreamId = "stream0"
 
     // MARK: - Public API
 
@@ -40,36 +42,53 @@ class VortexWebRTC: NSObject {
 
         let sig = VortexSignaling.shared
         sig.onSdpAnswer = { [weak self] type, sdp in
-            self?.handleAnswer(type: type, sdp: sdp)
+            self?.handlePublisherAnswer(type: type, sdp: sdp)
         }
-        sig.onRemoteIceTrickle = { [weak self] json in
-            self?.handleRemoteIce(json: json)
+        sig.onSdpOffer = { [weak self] type, sdp in
+            self?.handleSubscriberOffer(type: type, sdp: sdp)
+        }
+        sig.onRemoteIceTrickle = { [weak self] json, target in
+            self?.handleRemoteIce(json: json, target: target)
         }
 
         RTCInitializeSSL()
-        setupPeerConnection()
-        createAndSendOffer()
+
+        let enc = RTCDefaultVideoEncoderFactory()
+        let dec = RTCDefaultVideoDecoderFactory()
+        factory = RTCPeerConnectionFactory(encoderFactory: enc, decoderFactory: dec)
+
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        publisherPC  = factory?.peerConnection(with: makeConfig(), constraints: constraints, delegate: self)
+        subscriberPC = factory?.peerConnection(with: makeConfig(), constraints: constraints, delegate: self)
+
+        // Local mic track on the publisher.
+        let audioSource = factory?.audioSource(with: RTCMediaConstraints(
+            mandatoryConstraints: nil, optionalConstraints: nil))
+        if let audioSource = audioSource {
+            localAudioTrack = factory?.audioTrack(with: audioSource, trackId: localTrackId)
+        }
+        if let track = localAudioTrack {
+            publisherPC?.add(track, streamIds: [localStreamId])
+        }
+
+        // Register the track with the server (so we appear unmuted), then offer.
+        VortexSignaling.shared.sendAddTrack(cid: localTrackId, name: "microphone")
+        createAndSendPublisherOffer()
     }
 
     func stop() {
         isRunning = false
-        peerConnection?.close()
-        peerConnection = nil
+        publisherPC?.close();  publisherPC = nil
+        subscriberPC?.close(); subscriberPC = nil
         localAudioTrack = nil
+        audioConnectedFired = false
         if factory != nil {
             factory = nil
             RTCCleanupSSL()
         }
     }
 
-    // MARK: - Setup
-
-    private func setupPeerConnection() {
-        let encoderFactory = RTCDefaultVideoEncoderFactory()
-        let decoderFactory = RTCDefaultVideoDecoderFactory()
-        factory = RTCPeerConnectionFactory(encoderFactory: encoderFactory,
-                                           decoderFactory: decoderFactory)
-
+    private func makeConfig() -> RTCConfiguration {
         let config = RTCConfiguration()
         if iceServers.isEmpty {
             config.iceServers = [RTCIceServer(urlStrings: ["stun:stun.l.google.com:19302"])]
@@ -78,39 +97,48 @@ class VortexWebRTC: NSObject {
         }
         config.sdpSemantics = .unifiedPlan
         config.continualGatheringPolicy = .gatherContinually
+        return config
+    }
 
-        let constraints = RTCMediaConstraints(mandatoryConstraints: nil,
-                                              optionalConstraints: nil)
-        peerConnection = factory?.peerConnection(with: config,
-                                                  constraints: constraints,
-                                                  delegate: self)
+    /// Enable/disable the outgoing mic audio (sends silence when disabled).
+    func setMicEnabled(_ enabled: Bool) {
+        localAudioTrack?.isEnabled = enabled
+    }
 
-        // Add local audio track (microphone input)
-        let audioSource = factory?.audioSource(with: RTCMediaConstraints(
-            mandatoryConstraints: nil, optionalConstraints: nil))
-        if let source = audioSource {
-            localAudioTrack = factory?.audioTrack(with: source, trackId: "audio0")
-            if let track = localAudioTrack {
-                peerConnection?.add(track, streamIds: ["stream0"])
-            }
+    var isMicEnabled: Bool { localAudioTrack?.isEnabled ?? false }
+
+    /// Deafen: stop playing all remote audio (also applies to tracks added later).
+    func setDeafened(_ d: Bool) {
+        deafened = d
+        applyDeafen()
+    }
+
+    var isDeafened: Bool { deafened }
+
+    private func applyDeafen() {
+        guard let pc = subscriberPC else { return }
+        for r in pc.receivers {
+            (r.track as? RTCAudioTrack)?.isEnabled = !deafened
         }
     }
 
-    private func createAndSendOffer() {
+    // MARK: - Publisher (we offer)
+
+    private func createAndSendPublisherOffer() {
         let offerConstraints = RTCMediaConstraints(
-            mandatoryConstraints: ["OfferToReceiveAudio": "true",
+            mandatoryConstraints: ["OfferToReceiveAudio": "false",
                                    "OfferToReceiveVideo": "false"],
             optionalConstraints: nil
         )
-        peerConnection?.offer(for: offerConstraints) { [weak self] sdp, error in
+        publisherPC?.offer(for: offerConstraints) { [weak self] sdp, error in
             guard let self = self else { return }
             guard let sdp = sdp, error == nil else {
                 self.onError?("offer creation failed: \(error?.localizedDescription ?? "?")")
                 return
             }
-            self.peerConnection?.setLocalDescription(sdp) { err in
+            self.publisherPC?.setLocalDescription(sdp) { err in
                 if let err = err {
-                    self.onError?("setLocalDesc: \(err.localizedDescription)")
+                    self.onError?("setLocalDesc(pub): \(err.localizedDescription)")
                     return
                 }
                 let typeStr = self.sdpTypeString(sdp.type)
@@ -121,19 +149,50 @@ class VortexWebRTC: NSObject {
         }
     }
 
-    // MARK: - Remote SDP / ICE handling
-
-    private func handleAnswer(type: String, sdp: String) {
-        let sdpType = sdpTypeFromString(type)
-        let remoteSdp = RTCSessionDescription(type: sdpType, sdp: sdp)
-        peerConnection?.setRemoteDescription(remoteSdp) { [weak self] error in
+    private func handlePublisherAnswer(type: String, sdp: String) {
+        let remoteSdp = RTCSessionDescription(type: sdpTypeFromString(type), sdp: sdp)
+        publisherPC?.setRemoteDescription(remoteSdp) { [weak self] error in
             if let error = error {
-                self?.onError?("setRemoteDesc: \(error.localizedDescription)")
+                self?.onError?("setRemoteDesc(pub): \(error.localizedDescription)")
             }
         }
     }
 
-    private func handleRemoteIce(json: String) {
+    // MARK: - Subscriber (server offers, we answer)
+
+    private func handleSubscriberOffer(type: String, sdp: String) {
+        guard let sub = subscriberPC else { return }
+        let remoteSdp = RTCSessionDescription(type: sdpTypeFromString(type), sdp: sdp)
+        sub.setRemoteDescription(remoteSdp) { [weak self] error in
+            guard let self = self else { return }
+            if let error = error {
+                self.onError?("setRemoteDesc(sub): \(error.localizedDescription)")
+                return
+            }
+            let answerConstraints = RTCMediaConstraints(mandatoryConstraints: nil,
+                                                        optionalConstraints: nil)
+            sub.answer(for: answerConstraints) { sdpAns, err in
+                guard let sdpAns = sdpAns, err == nil else {
+                    self.onError?("answer creation failed: \(err?.localizedDescription ?? "?")")
+                    return
+                }
+                sub.setLocalDescription(sdpAns) { e in
+                    if let e = e {
+                        self.onError?("setLocalDesc(sub): \(e.localizedDescription)")
+                        return
+                    }
+                    let typeStr = self.sdpTypeString(sdpAns.type)
+                    DispatchQueue.main.async {
+                        VortexSignaling.shared.sendSdpAnswer(type: typeStr, sdp: sdpAns.sdp)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Remote ICE
+
+    private func handleRemoteIce(json: String, target: Int) {
         guard let data = json.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let candidateStr = dict["candidate"] as? String else { return }
@@ -142,7 +201,9 @@ class VortexWebRTC: NSObject {
         let candidate = RTCIceCandidate(sdp: candidateStr,
                                          sdpMLineIndex: sdpMLineIndex,
                                          sdpMid: sdpMid)
-        peerConnection?.add(candidate)
+        // target: 0 = PUBLISHER, 1 = SUBSCRIBER
+        if target == 1 { subscriberPC?.add(candidate) }
+        else           { publisherPC?.add(candidate) }
     }
 
     // MARK: - Helpers
@@ -163,6 +224,12 @@ class VortexWebRTC: NSObject {
         default:         return .offer
         }
     }
+
+    private func fireAudioConnectedOnce() {
+        guard !audioConnectedFired else { return }
+        audioConnectedFired = true
+        DispatchQueue.main.async { self.onAudioConnected?() }
+    }
 }
 
 // MARK: - RTCPeerConnectionDelegate
@@ -171,7 +238,6 @@ extension VortexWebRTC: RTCPeerConnectionDelegate {
 
     func peerConnection(_ pc: RTCPeerConnection,
                         didGenerate candidate: RTCIceCandidate) {
-        // Build standard browser-compatible ICE candidate JSON
         var dict: [String: Any] = [
             "candidate": candidate.sdp,
             "sdpMLineIndex": candidate.sdpMLineIndex
@@ -179,15 +245,16 @@ extension VortexWebRTC: RTCPeerConnectionDelegate {
         if let mid = candidate.sdpMid { dict["sdpMid"] = mid }
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
               let json = String(data: data, encoding: .utf8) else { return }
+        let target = (pc === subscriberPC) ? 1 : 0
         DispatchQueue.main.async {
-            VortexSignaling.shared.sendIceTrickle(json)
+            VortexSignaling.shared.sendIceTrickle(json, target: target)
         }
     }
 
     func peerConnection(_ pc: RTCPeerConnection,
                         didChange newState: RTCIceConnectionState) {
         if newState == .connected || newState == .completed {
-            DispatchQueue.main.async { self.onAudioConnected?() }
+            fireAudioConnectedOnce()
         } else if newState == .failed {
             DispatchQueue.main.async { self.onError?("ICE connection failed") }
         }
@@ -200,10 +267,15 @@ extension VortexWebRTC: RTCPeerConnectionDelegate {
         }
     }
 
+    func peerConnection(_ pc: RTCPeerConnection, didAdd stream: RTCMediaStream) {
+        // Remote audio arrives on the subscriber PC — honour current deafen state.
+        for t in stream.audioTracks { t.isEnabled = !deafened }
+        fireAudioConnectedOnce()
+    }
+
     func peerConnectionShouldNegotiate(_ pc: RTCPeerConnection) {}
     func peerConnection(_ pc: RTCPeerConnection,
                         didChange state: RTCSignalingState) {}
-    func peerConnection(_ pc: RTCPeerConnection, didAdd stream: RTCMediaStream) {}
     func peerConnection(_ pc: RTCPeerConnection, didRemove stream: RTCMediaStream) {}
     func peerConnection(_ pc: RTCPeerConnection,
                         didChange state: RTCIceGatheringState) {}

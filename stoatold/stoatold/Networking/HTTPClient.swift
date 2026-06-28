@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 // iOS 6-safe HTTP client using NSURLConnection delegate.
 // NSURLConnection.sendAsynchronousRequest silently hangs on iOS 6/7 — never use it.
@@ -152,5 +153,185 @@ class HTTPClient: NSObject, NSURLConnectionDelegate, NSURLConnectionDataDelegate
 
     func connectionDidFinishLoading(_ connection: NSURLConnection) {
         done(responseData as Data, statusCode, nil)
+    }
+}
+
+
+// CDNImage — HTTPS image loader over the OpenSSL bridge (owsl).
+// iOS 6 Secure Transport only negotiates CBC ciphers, but the stoat CDN requires
+// GCM, so NSURLConnection fails the TLS handshake before any data flows. We reuse
+// the owsl bridge (OpenSSL, same one VortexSignaling uses) to do a plain HTTPS GET
+// and decode the body into a UIImage. The GET request is written by us; the bridge
+// only does TCP + TLS.
+final class CDNImage: NSObject {
+
+    typealias Completion = (UIImage?) -> Void
+
+    private static let cache  = NSCache<NSString, UIImage>()
+    private static var active: [CDNImage] = []
+
+    private var owslCtx:    OpaquePointer? = nil
+    private var buffer      = Data()
+    private var done        = false
+    private let cacheKey:   String
+    private let redirectsLeft: Int
+    private let completion: Completion
+
+    private init(cacheKey: String, redirectsLeft: Int, completion: @escaping Completion) {
+        self.cacheKey      = cacheKey
+        self.redirectsLeft = redirectsLeft
+        self.completion    = completion
+    }
+
+    // MARK: Public
+
+    static func load(_ urlString: String, completion: @escaping Completion) {
+        if let cached = cache.object(forKey: urlString as NSString) {
+            completion(cached); return
+        }
+        fetch(urlString, cacheKey: urlString, redirectsLeft: 4, completion: completion)
+    }
+
+    private static func fetch(_ urlString: String, cacheKey: String,
+                              redirectsLeft: Int, completion: @escaping Completion) {
+        guard let url = URL(string: urlString), let host = url.host else {
+            completion(nil); return
+        }
+        let port = url.port ?? (url.scheme == "http" ? 80 : 443)
+        var path = url.path.isEmpty ? "/" : url.path
+        if let q = url.query { path += "?\(q)" }
+
+        let client = CDNImage(cacheKey: cacheKey, redirectsLeft: redirectsLeft,
+                              completion: completion)
+        active.append(client)
+
+        let selfPtr = Unmanaged.passUnretained(client).toOpaque()
+        guard let ctx = owsl_create(host, CInt(port),
+                                    CDNImage.readCb, CDNImage.eventCb, selfPtr) else {
+            client.finish(nil); return
+        }
+        client.owslCtx = ctx
+
+        let req = "GET \(path) HTTP/1.1\r\n"
+                + "Host: \(host)\r\n"
+                + "User-Agent: stoatold/1.0\r\n"
+                + "Accept: */*\r\n"
+                + "Connection: close\r\n\r\n"
+
+        DispatchQueue(label: "com.stoatold.cdnimg.connect").async {
+            let ret = owsl_connect(ctx)
+            DispatchQueue.main.async {
+                guard client.owslCtx != nil else { return }
+                if ret != 0 { client.finish(nil); return }
+                owsl_start_reading(ctx)
+                client.write(req.data(using: .utf8)!)
+            }
+        }
+    }
+
+    // MARK: C callbacks (fire on bg thread -> hop to main)
+
+    private static let readCb: OWSL_read_cb = { buf, len, ud in
+        guard let ud = ud, let buf = buf else { return }
+        let c = Unmanaged<CDNImage>.fromOpaque(ud).takeUnretainedValue()
+        let data = Data(bytes: buf, count: len)
+        DispatchQueue.main.async { c.buffer.append(data) }
+    }
+
+    private static let eventCb: OWSL_event_cb = { kind, _, ud in
+        guard let ud = ud else { return }
+        let c = Unmanaged<CDNImage>.fromOpaque(ud).takeUnretainedValue()
+        DispatchQueue.main.async {
+            if kind == 1 { c.handleResponse() }   // EOF — full body received
+            else         { c.finish(nil) }        // error
+        }
+    }
+
+    // MARK: Helpers (all on main thread)
+
+    private func write(_ data: Data) {
+        guard let ctx = owslCtx else { return }
+        data.withUnsafeBytes { ptr in
+            _ = owsl_write(ctx, ptr.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count)
+        }
+    }
+
+    private func handleResponse() {
+        guard owslCtx != nil, !done else { return }
+        let sepData = Data([0x0D, 0x0A, 0x0D, 0x0A])
+        guard let r = buffer.range(of: sepData) else { finish(nil); return }
+        let headerData = buffer.subdata(in: buffer.startIndex..<r.lowerBound)
+        var body       = buffer.subdata(in: r.upperBound..<buffer.endIndex)
+
+        let headerStr  = String(data: headerData, encoding: .isoLatin1) ?? ""
+        let lines      = headerStr.components(separatedBy: "\r\n")
+        let statusLine = lines.first ?? ""
+        let sp         = statusLine.components(separatedBy: " ")
+        let status     = sp.count >= 2 ? (Int(sp[1]) ?? 0) : 0
+
+        var headers = [String: String]()
+        for line in lines.dropFirst() {
+            if let idx = line.firstIndex(of: ":") {
+                let k = String(line[line.startIndex..<idx]).trimmingCharacters(in: .whitespaces).lowercased()
+                let v = String(line[line.index(after: idx)...]).trimmingCharacters(in: .whitespaces)
+                headers[k] = v
+            }
+        }
+
+        // Follow CDN redirects (e.g. 302 to S3/CloudFront) — may change host.
+        if status >= 300 && status < 400, let loc = headers["location"], redirectsLeft > 0 {
+            let key = cacheKey, left = redirectsLeft - 1, comp = completion
+            done = true
+            cleanup()
+            CDNImage.fetch(loc, cacheKey: key, redirectsLeft: left, completion: comp)
+            return
+        }
+
+        guard status == 200 else { finish(nil); return }
+
+        if (headers["transfer-encoding"]?.lowercased().contains("chunked")) == true {
+            body = CDNImage.dechunk(body)
+        }
+
+        let img = UIImage(data: body)
+        if let img = img { CDNImage.cache.setObject(img, forKey: cacheKey as NSString) }
+        finish(img)
+    }
+
+    private static func dechunk(_ data: Data) -> Data {
+        var out = Data()
+        var i = data.startIndex
+        let crlf = Data([0x0D, 0x0A])
+        while i < data.endIndex {
+            guard let r = data.range(of: crlf, in: i..<data.endIndex) else { break }
+            let sizeLine = String(data: data.subdata(in: i..<r.lowerBound), encoding: .ascii) ?? ""
+            let hex = sizeLine.components(separatedBy: ";").first ?? sizeLine
+            guard let size = Int(hex.trimmingCharacters(in: .whitespaces), radix: 16) else { break }
+            if size == 0 { break }
+            let start = r.upperBound
+            let end = data.index(start, offsetBy: size, limitedBy: data.endIndex) ?? data.endIndex
+            out.append(data.subdata(in: start..<end))
+            i = data.index(end, offsetBy: 2, limitedBy: data.endIndex) ?? data.endIndex
+        }
+        return out
+    }
+
+    private func finish(_ img: UIImage?) {
+        if done { return }
+        done = true
+        cleanup()
+        completion(img)
+    }
+
+    // Keep self in `active` until owsl_destroy has joined the read thread, so no
+    // callback fires into a deallocated instance.
+    private func cleanup() {
+        guard let ctx = owslCtx else { return }
+        owslCtx = nil
+        owsl_close(ctx)
+        DispatchQueue(label: "com.stoatold.cdnimg.destroy").async {
+            owsl_destroy(ctx)
+            DispatchQueue.main.async { CDNImage.active.removeAll { $0 === self } }
+        }
     }
 }

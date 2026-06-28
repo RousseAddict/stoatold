@@ -9,6 +9,8 @@ class VoiceVC: UIViewController {
     private let statusLbl   = UILabel()
     private let participantsTbl = UITableView(frame: .zero, style: .plain)
     private let leaveBtn    = UIButton(type: .custom)
+    private let micBtn      = UIButton(type: .custom)
+    private let deafBtn     = UIButton(type: .custom)
 
     private var participants: [String] = []   // user IDs currently in the call
 
@@ -22,8 +24,6 @@ class VoiceVC: UIViewController {
         super.viewDidLoad()
         title = channel.name
         view.backgroundColor = UIColor(red: 0.1, green: 0.1, blue: 0.14, alpha: 1)
-        navigationItem.leftBarButtonItem = UIBarButtonItem(
-            title: "< Back", style: .plain, target: self, action: #selector(leave))
 
         buildUI()
         setupSignaling()
@@ -32,7 +32,10 @@ class VoiceVC: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        if isMovingFromParent { VortexSignaling.shared.leave() }
+        if isMovingFromParent {
+            VortexWebRTC.shared.stop()
+            VortexSignaling.shared.leave()
+        }
     }
 
     // MARK: - UI
@@ -51,7 +54,7 @@ class VoiceVC: UIViewController {
         view.addSubview(statusLbl)
 
         // Participants table
-        participantsTbl.frame           = CGRect(x: 0, y: 40, width: w, height: h - 80)
+        participantsTbl.frame           = CGRect(x: 0, y: 40, width: w, height: h - 116)
         participantsTbl.backgroundColor = UIColor(red: 0.1, green: 0.1, blue: 0.14, alpha: 1)
         participantsTbl.separatorColor  = UIColor(white: 1, alpha: 0.07)
         participantsTbl.rowHeight       = 52
@@ -59,16 +62,130 @@ class VoiceVC: UIViewController {
         participantsTbl.register(ParticipantCell.self, forCellReuseIdentifier: "p")
         view.addSubview(participantsTbl)
 
-        // Leave button at bottom
-        leaveBtn.backgroundColor = UIColor(red: 0.70, green: 0.18, blue: 0.18, alpha: 1)
-        leaveBtn.setTitle("Leave Call", for: .normal)
-        leaveBtn.setTitleColor(.white, for: .normal)
-        leaveBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 16)
-        leaveBtn.layer.cornerRadius = 8
-        leaveBtn.layer.masksToBounds = true
-        leaveBtn.frame = CGRect(x: 20, y: h - 36, width: w - 40, height: 44)
+        // Bottom control row: three round icon buttons — Mic | Deafen | Leave.
+        let d: CGFloat   = 58
+        let gap: CGFloat = 26
+        let rowY  = h - 64
+        let total = d * 3 + gap * 2
+        var x     = (w - total) / 2
+
+        let darkBG = UIColor(red: 0.20, green: 0.20, blue: 0.26, alpha: 1)
+
+        styleRoundButton(micBtn, bg: darkBG, diameter: d)
+        micBtn.frame = CGRect(x: x, y: rowY, width: d, height: d)
+        micBtn.addTarget(self, action: #selector(toggleMic), for: .touchUpInside)
+        view.addSubview(micBtn)
+        x += d + gap
+
+        styleRoundButton(deafBtn, bg: darkBG, diameter: d)
+        deafBtn.frame = CGRect(x: x, y: rowY, width: d, height: d)
+        deafBtn.addTarget(self, action: #selector(toggleDeafen), for: .touchUpInside)
+        view.addSubview(deafBtn)
+        x += d + gap
+
+        styleRoundButton(leaveBtn, bg: UIColor(red: 0.70, green: 0.18, blue: 0.18, alpha: 1), diameter: d)
+        leaveBtn.frame = CGRect(x: x, y: rowY, width: d, height: d)
+        leaveBtn.setImage(VoiceVC.leaveImage(), for: .normal)
         leaveBtn.addTarget(self, action: #selector(leave), for: .touchUpInside)
         view.addSubview(leaveBtn)
+
+        updateMicIcon()
+        updateDeafIcon()
+    }
+
+    private func styleRoundButton(_ b: UIButton, bg: UIColor, diameter: CGFloat) {
+        b.backgroundColor      = bg
+        b.layer.cornerRadius   = diameter / 2
+        b.layer.masksToBounds  = true
+    }
+
+    private func updateMicIcon() {
+        micBtn.setImage(VoiceVC.micImage(muted: !VortexWebRTC.shared.isMicEnabled), for: .normal)
+    }
+
+    private func updateDeafIcon() {
+        deafBtn.setImage(VoiceVC.headphonesImage(off: VortexWebRTC.shared.isDeafened), for: .normal)
+    }
+
+    // MARK: - Icon drawing (CoreGraphics — iOS 6 safe, no asset catalog needed)
+
+    private static let slashBG = UIColor(red: 0.20, green: 0.20, blue: 0.26, alpha: 1)
+
+    /// Renders a white glyph in a 30pt box; when `slashed` overlays a red "/" with a
+    /// background-coloured cut beneath it so it reads as crossed-out.
+    private static func iconImage(slashed: Bool, slashCutColor: UIColor,
+                                  _ draw: (CGFloat) -> Void) -> UIImage {
+        let s: CGFloat = 30
+        UIGraphicsBeginImageContextWithOptions(CGSize(width: s, height: s), false, 0)
+        draw(s)
+        if slashed {
+            let cut = UIBezierPath()
+            cut.move(to: CGPoint(x: s * 0.16, y: s * 0.20))
+            cut.addLine(to: CGPoint(x: s * 0.84, y: s * 0.86))
+            cut.lineWidth   = max(4, s * 0.18)
+            cut.lineCapStyle = .round
+            slashCutColor.setStroke(); cut.stroke()
+
+            let slash = UIBezierPath()
+            slash.move(to: CGPoint(x: s * 0.18, y: s * 0.18))
+            slash.addLine(to: CGPoint(x: s * 0.86, y: s * 0.84))
+            slash.lineWidth   = max(2, s * 0.09)
+            slash.lineCapStyle = .round
+            UIColor(red: 0.95, green: 0.42, blue: 0.42, alpha: 1).setStroke(); slash.stroke()
+        }
+        let img = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        return img ?? UIImage()
+    }
+
+    private static func micImage(muted: Bool) -> UIImage {
+        return iconImage(slashed: muted, slashCutColor: slashBG) { s in
+            UIColor.white.setFill(); UIColor.white.setStroke()
+            let lw = max(1.5, s * 0.07)
+            let bw = s * 0.30, bh = s * 0.42
+            let bx = (s - bw) / 2, by = s * 0.12
+            UIBezierPath(roundedRect: CGRect(x: bx, y: by, width: bw, height: bh),
+                         cornerRadius: bw / 2).fill()
+            let arc = UIBezierPath(arcCenter: CGPoint(x: s / 2, y: by + bh * 0.55),
+                                   radius: bw * 0.95, startAngle: 0, endAngle: CGFloat.pi,
+                                   clockwise: true)
+            arc.lineWidth = lw; arc.stroke()
+            let stand = UIBezierPath()
+            stand.move(to: CGPoint(x: s / 2, y: by + bh * 0.55 + bw * 0.95))
+            stand.addLine(to: CGPoint(x: s / 2, y: s * 0.86))
+            stand.lineWidth = lw; stand.stroke()
+            let base = UIBezierPath()
+            base.move(to: CGPoint(x: s * 0.34, y: s * 0.86))
+            base.addLine(to: CGPoint(x: s * 0.66, y: s * 0.86))
+            base.lineWidth = lw; base.stroke()
+        }
+    }
+
+    private static func headphonesImage(off: Bool) -> UIImage {
+        return iconImage(slashed: off, slashCutColor: slashBG) { s in
+            UIColor.white.setFill(); UIColor.white.setStroke()
+            let lw = max(1.5, s * 0.07)
+            let r  = s * 0.30
+            let band = UIBezierPath(arcCenter: CGPoint(x: s / 2, y: s * 0.54),
+                                    radius: r, startAngle: CGFloat.pi, endAngle: 2 * CGFloat.pi,
+                                    clockwise: true)
+            band.lineWidth = lw; band.stroke()
+            let cw = s * 0.15, ch = s * 0.26
+            UIBezierPath(roundedRect: CGRect(x: s / 2 - r - cw / 2, y: s * 0.50, width: cw, height: ch),
+                         cornerRadius: cw * 0.4).fill()
+            UIBezierPath(roundedRect: CGRect(x: s / 2 + r - cw / 2, y: s * 0.50, width: cw, height: ch),
+                         cornerRadius: cw * 0.4).fill()
+        }
+    }
+
+    private static func leaveImage() -> UIImage {
+        return iconImage(slashed: false, slashCutColor: .clear) { s in
+            UIColor.white.setStroke()
+            let p = UIBezierPath()
+            p.move(to: CGPoint(x: s * 0.32, y: s * 0.32)); p.addLine(to: CGPoint(x: s * 0.68, y: s * 0.68))
+            p.move(to: CGPoint(x: s * 0.68, y: s * 0.32)); p.addLine(to: CGPoint(x: s * 0.32, y: s * 0.68))
+            p.lineWidth = max(2, s * 0.10); p.lineCapStyle = .round; p.stroke()
+        }
     }
 
     // MARK: - Signaling callbacks
@@ -154,7 +271,19 @@ class VoiceVC: UIViewController {
                 }
             }
             VortexWebRTC.shared.start()
+            VortexWebRTC.shared.setMicEnabled(true)
+            DispatchQueue.main.async { self.updateMicIcon() }
         }
+    }
+
+    @objc private func toggleMic() {
+        VortexWebRTC.shared.setMicEnabled(!VortexWebRTC.shared.isMicEnabled)
+        updateMicIcon()
+    }
+
+    @objc private func toggleDeafen() {
+        VortexWebRTC.shared.setDeafened(!VortexWebRTC.shared.isDeafened)
+        updateDeafIcon()
     }
 
     @objc private func leave() {

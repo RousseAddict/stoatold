@@ -8,6 +8,8 @@
 
 /* Begin PBXBuildFile section */
 		BB000001000000000000BC15 /* CrashLogger.m in Sources */ = {isa = PBXBuildFile; fileRef = BB000001000000000000BB15 /* CrashLogger.m */; };
+		BB000001000000000000BC16 /* RTCAudioProbe.m in Sources */ = {isa = PBXBuildFile; fileRef = BB000001000000000000BB17 /* RTCAudioProbe.m */; };
+		BB000001000000000000BC17 /* CrashTrace.m in Sources */ = {isa = PBXBuildFile; fileRef = BB000001000000000000BB19 /* CrashTrace.m */; };
 
 		BB000001000000000000BC14 /* VortexWebRTC.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB000001000000000000BB14 /* VortexWebRTC.swift */; };
 
@@ -59,6 +61,10 @@
 		BB000001000000000000BB15 /* CrashLogger.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CrashLogger.m; sourceTree = "<group>"; };
 
 		BB000001000000000000BB16 /* CrashLogger.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CrashLogger.h; sourceTree = "<group>"; };
+		BB000001000000000000BB17 /* RTCAudioProbe.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RTCAudioProbe.m; sourceTree = "<group>"; };
+		BB000001000000000000BB18 /* RTCAudioProbe.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RTCAudioProbe.h; sourceTree = "<group>"; };
+		BB000001000000000000BB19 /* CrashTrace.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CrashTrace.m; sourceTree = "<group>"; };
+		BB000001000000000000BB1A /* CrashTrace.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CrashTrace.h; sourceTree = "<group>"; };
 
 		BB000001000000000000BB14 /* VortexWebRTC.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VortexWebRTC.swift; sourceTree = "<group>"; };
 
@@ -144,6 +150,10 @@
 			children = (
 				BB000001000000000000BB16 /* CrashLogger.h */,
 				BB000001000000000000BB15 /* CrashLogger.m */,
+				BB000001000000000000BB18 /* RTCAudioProbe.h */,
+				BB000001000000000000BB17 /* RTCAudioProbe.m */,
+				BB000001000000000000BB1A /* CrashTrace.h */,
+				BB000001000000000000BB19 /* CrashTrace.m */,
 				BB000001000000000000BB12 /* stoatold-Bridging-Header.h */,
 				BB000001000000000000AA03 /* Models */,
 				BB000001000000000000AA01 /* Networking */,
@@ -366,6 +376,8 @@
 				BB000001000000000000BC10 /* atomic_stubs.c in Sources */,
 				A34362FF2FD764260064ADE1 /* AppDelegate.swift in Sources */,
 				BB000001000000000000BC15 /* CrashLogger.m in Sources */,
+				BB000001000000000000BC16 /* RTCAudioProbe.m in Sources */,
+				BB000001000000000000BC17 /* CrashTrace.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
