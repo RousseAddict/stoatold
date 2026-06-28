@@ -5,5 +5,6 @@
 #import "CrashLogger.h"
 #import "RTCAudioProbe.h"
 #import "CrashTrace.h"
+#include "webp/decode.h"
 
 #endif

@@ -136,6 +136,9 @@ class VortexSignaling {
     private func doJoinCall(sessionToken: String, nodeName: String?) {
         var bodyDict = [String: Any]()
         if let n = nodeName { bodyDict["node"] = n }
+        // Force-disconnect any lingering voice session on another device / stale session,
+        // so a rejoin after an unclean exit isn't rejected with HTTP 400.
+        bodyDict["force_disconnect"] = true
         guard let body = try? JSONSerialization.data(withJSONObject: bodyDict) else { return }
         HTTPClient.request(
             "\(APIClient.baseURL)/channels/\(channelId)/join_call",

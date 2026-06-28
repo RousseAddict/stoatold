@@ -32,6 +32,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UIAlertViewDelegate {
         return true
     }
 
+    // Lock the whole app to portrait (authoritative on iOS 6/7 — the app-level plist
+    // ~iphone key alone is not always honored under a UINavigationController).
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        return .portrait
+    }
+
     func alertView(_ alertView: UIAlertView, clickedButtonAt buttonIndex: Int) {
         if buttonIndex == 1, let t = pendingTrace {
             UIPasteboard.general.string = t

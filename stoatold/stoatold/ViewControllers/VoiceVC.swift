@@ -13,6 +13,8 @@ class VoiceVC: UIViewController {
     private let deafBtn     = UIButton(type: .custom)
 
     private var participants: [String] = []   // user IDs currently in the call
+    private var memberNames:   [String: String] = [:]   // uid -> nickname ?? username
+    private var memberAvatars: [String: String] = [:]   // uid -> avatar URL
 
     init(channel: StoatChannel) {
         self.channel = channel
@@ -27,6 +29,7 @@ class VoiceVC: UIViewController {
 
         buildUI()
         setupSignaling()
+        fetchServerMembers()
         VortexSignaling.shared.joinVoice(channelId: channel.id)
     }
 
@@ -188,6 +191,40 @@ class VoiceVC: UIViewController {
         }
     }
 
+    // MARK: - Member info (nickname + avatar, same source as the member list)
+
+    private func fetchServerMembers() {
+        guard let serverId = channel.serverId else { return }
+        APIClient.get("/servers/\(serverId)/members") { [weak self] json, err in
+            guard let self = self, err == nil, let dict = json as? [String: Any] else { return }
+            let users = dict["users"] as? [[String: Any]] ?? []
+            var userMap: [String: [String: Any]] = [:]
+            for u in users { if let id = u["_id"] as? String { userMap[id] = u } }
+
+            let memberList = dict["members"] as? [[String: Any]] ?? []
+            for mem in memberList {
+                let uid: String
+                if let mid = mem["_id"] as? String {
+                    uid = mid
+                } else if let mid = mem["_id"] as? [String: Any],
+                          let u = mid["user"] as? String {
+                    uid = u
+                } else { continue }
+
+                let userDict = userMap[uid] ?? [:]
+                let username = userDict["username"] as? String ?? uid
+                let nickname = mem["nickname"] as? String
+                self.memberNames[uid] = nickname ?? username
+                // server member avatar takes priority over the global user avatar
+                if let aid = ((mem["avatar"] as? [String: Any])?["_id"] as? String)
+                    ?? ((userDict["avatar"] as? [String: Any])?["_id"] as? String) {
+                    self.memberAvatars[uid] = "https://cdn.stoatusercontent.com/avatars/\(aid)"
+                }
+            }
+            self.participantsTbl.reloadData()
+        }
+    }
+
     // MARK: - Signaling callbacks
 
     private func setupSignaling() {
@@ -304,11 +341,13 @@ extension VoiceVC: UITableViewDataSource {
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "p", for: indexPath) as! ParticipantCell
         if participants.isEmpty {
-            cell.configure(name: "No one else in the call", isSpeaking: false, isEmpty: true)
+            cell.configure(uid: "", name: "No one else in the call",
+                           avatarURL: nil, isSpeaking: false, isEmpty: true)
         } else {
             let uid  = participants[indexPath.row]
-            let name = StoatSocket.shared.allUsers[uid]?.username ?? uid
-            cell.configure(name: name, isSpeaking: false, isEmpty: false)
+            let name = memberNames[uid] ?? StoatSocket.shared.allUsers[uid]?.username ?? uid
+            cell.configure(uid: uid, name: name, avatarURL: memberAvatars[uid],
+                           isSpeaking: false, isEmpty: false)
         }
         return cell
     }
@@ -318,9 +357,19 @@ extension VoiceVC: UITableViewDataSource {
 
 private class ParticipantCell: UITableViewCell {
 
-    private let avatarView = UIView()
-    private let nameLbl    = UILabel()
-    private let speakDot   = UIView()
+    private let avatarView  = UIView()
+    private let avatarLabel = UILabel()
+    private let avatarImage = UIImageView()
+    private let nameLbl     = UILabel()
+    private let speakDot    = UIView()
+    private var currentAvatarURL: String?
+
+    private static let accents: [UIColor] = [
+        UIColor(red: 0.55, green: 0.27, blue: 0.87, alpha: 1),
+        UIColor(red: 0.23, green: 0.65, blue: 0.35, alpha: 1),
+        UIColor(red: 0.20, green: 0.55, blue: 0.87, alpha: 1),
+        UIColor(red: 0.87, green: 0.35, blue: 0.20, alpha: 1),
+    ]
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
@@ -333,6 +382,19 @@ private class ParticipantCell: UITableViewCell {
         avatarView.layer.masksToBounds = true
         avatarView.frame = CGRect(x: 16, y: 8, width: 36, height: 36)
         contentView.addSubview(avatarView)
+
+        avatarLabel.backgroundColor = .clear
+        avatarLabel.textColor       = .white
+        avatarLabel.font            = UIFont.boldSystemFont(ofSize: 16)
+        avatarLabel.textAlignment   = .center
+        avatarLabel.frame           = avatarView.bounds
+        avatarView.addSubview(avatarLabel)
+
+        avatarImage.contentMode   = .scaleAspectFill
+        avatarImage.clipsToBounds = true
+        avatarImage.frame         = avatarView.bounds
+        avatarImage.isHidden      = true
+        avatarView.addSubview(avatarImage)
 
         // Name label
         nameLbl.backgroundColor = .clear
@@ -353,7 +415,8 @@ private class ParticipantCell: UITableViewCell {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(name: String, isSpeaking: Bool, isEmpty: Bool) {
+    func configure(uid: String, name: String, avatarURL: String?,
+                   isSpeaking: Bool, isEmpty: Bool) {
         nameLbl.text      = name
         nameLbl.textColor = isEmpty
             ? UIColor(white: 0.35, alpha: 1)
@@ -363,5 +426,29 @@ private class ParticipantCell: UITableViewCell {
             : UIFont.systemFont(ofSize: 15)
         avatarView.isHidden = isEmpty
         speakDot.isHidden   = !isSpeaking
+
+        if isEmpty {
+            avatarLabel.text = ""
+            loadAvatar(nil)
+        } else {
+            avatarLabel.text = String(name.prefix(1)).uppercased()
+            let idx = (uid.unicodeScalars.first.map { Int($0.value) } ?? 0)
+                % ParticipantCell.accents.count
+            avatarView.backgroundColor = ParticipantCell.accents[idx]
+            loadAvatar(avatarURL)
+        }
+    }
+
+    private func loadAvatar(_ urlString: String?) {
+        avatarImage.image    = nil
+        avatarImage.isHidden = true
+        currentAvatarURL     = urlString
+        guard let urlString = urlString else { return }
+        CDNImage.load(urlString) { [weak self] img in
+            guard let img = img, let self = self,
+                  self.currentAvatarURL == urlString else { return }
+            self.avatarImage.image    = img
+            self.avatarImage.isHidden = false
+        }
     }
 }

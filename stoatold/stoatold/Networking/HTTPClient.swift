@@ -293,9 +293,50 @@ final class CDNImage: NSObject {
             body = CDNImage.dechunk(body)
         }
 
-        let img = UIImage(data: body)
+        // The stoat CDN re-encodes everything to WebP, which UIImage cannot decode on
+        // iOS 6/7. Fall back to the bundled libwebp decoder.
+        let img = UIImage(data: body) ?? CDNImage.decodeWebP(body)
         if let img = img { CDNImage.cache.setObject(img, forKey: cacheKey as NSString) }
         finish(img)
+    }
+
+    // WebP -> UIImage via libwebp (WebPDecodeRGBA gives straight-alpha RGBA8888).
+    private static func decodeWebP(_ data: Data) -> UIImage? {
+        var width:  Int32 = 0
+        var height: Int32 = 0
+        let decoded: UnsafeMutablePointer<UInt8>? = data.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            return WebPDecodeRGBA(base, data.count, &width, &height)
+        }
+        guard let rgba = decoded, width > 0, height > 0 else { return nil }
+        let w = Int(width), h = Int(height)
+        let size = w * h * 4
+
+        // Premultiply alpha in place (CoreGraphics needs premultiplied for rendering).
+        var i = 0
+        while i < size {
+            let a = UInt32(rgba[i + 3])
+            if a < 255 {
+                rgba[i]     = UInt8(UInt32(rgba[i])     * a / 255)
+                rgba[i + 1] = UInt8(UInt32(rgba[i + 1]) * a / 255)
+                rgba[i + 2] = UInt8(UInt32(rgba[i + 2]) * a / 255)
+            }
+            i += 4
+        }
+
+        guard let provider = CGDataProvider(
+            dataInfo: rgba, data: rgba, size: size,
+            releaseData: { info, _, _ in if let info = info { WebPFree(info) } }
+        ) else { WebPFree(rgba); return nil }
+
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        guard let cg = CGImage(
+            width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: bitmapInfo, provider: provider, decode: nil,
+            shouldInterpolate: true, intent: .defaultIntent
+        ) else { return nil }
+        return UIImage(cgImage: cg)
     }
 
     private static func dechunk(_ data: Data) -> Data {
