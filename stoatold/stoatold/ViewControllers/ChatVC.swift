@@ -445,6 +445,7 @@ private class MessageCell: UITableViewCell {
     private var currentAttachId: String?
     var onImageTap: ((UIImage) -> Void)?
     var detectedURLs: [NSURL] = []
+    private var rawText = ""
 
     private static let imgCache = NSCache<NSString, UIImage>()
 
@@ -495,9 +496,30 @@ private class MessageCell: UITableViewCell {
         contentView.addSubview(attachImg)
         let tap = UITapGestureRecognizer(target: self, action: #selector(imgTapped))
         attachImg.addGestureRecognizer(tap)
+
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
+        contentView.addGestureRecognizer(longPress)
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override var canBecomeFirstResponder: Bool { return true }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        return action == #selector(copy(_:)) && !rawText.isEmpty
+    }
+
+    override func copy(_ sender: Any?) {
+        UIPasteboard.general.string = rawText
+    }
+
+    @objc private func longPressed(_ gr: UILongPressGestureRecognizer) {
+        guard gr.state == .began, !rawText.isEmpty else { return }
+        becomeFirstResponder()
+        let menu = UIMenuController.shared
+        menu.setTargetRect(contentLbl.frame, in: contentView)
+        menu.setMenuVisible(true, animated: true)
+    }
 
     @objc private func imgTapped() { if let img = attachImg.image { onImageTap?(img) } }
 
@@ -507,6 +529,7 @@ private class MessageCell: UITableViewCell {
     }
 
     func configure(with msg: StoatMessage) {
+        rawText = msg.content
         let w = UIScreen.main.bounds.width - 24
         authorLbl.text  = msg.authorName
         authorLbl.frame = CGRect(x: 12, y: 8, width: w - 52, height: 16)
