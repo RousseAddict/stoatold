@@ -17,6 +17,13 @@ class ChatVC: UIViewController {
     private var isLoadingOlder  = false
     private let loadMoreBtn     = UIButton(type: .custom)
 
+    // Typing indicator
+    private let typingLabel     = UILabel()
+    private var typingUserIds:  Set<String> = []
+    private var typingTimers:   [String: Timer] = [:]
+    private var sentTyping      = false
+    private var typingIdleTimer: Timer?
+
     private lazy var baseH: CGFloat = UIScreen.main.bounds.height - 64
 
     init(channel: StoatChannel) {
@@ -51,6 +58,10 @@ class ChatVC: UIViewController {
         StoatSocket.shared.activeChannelId = nil
         NotificationCenter.default.removeObserver(self)
         StoatSocket.shared.onEvent = nil
+        stopTypingSend()
+        for (_, t) in typingTimers { t.invalidate() }
+        typingTimers.removeAll()
+        typingUserIds.removeAll()
     }
 
     // MARK: - Build UI
@@ -108,6 +119,7 @@ class ChatVC: UIViewController {
         textField.returnKeyType = .send
         textField.delegate = self
         textField.placeholder = "Message #\(channel.name)"
+        textField.addTarget(self, action: #selector(textChanged), for: .editingChanged)
         inputBar.addSubview(textField)
 
         tableView.frame = CGRect(x: 0, y: 0, width: w, height: h - inputH)
@@ -137,6 +149,19 @@ class ChatVC: UIViewController {
         loadMoreBtn.frame = CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 40)
         loadMoreBtn.addTarget(self, action: #selector(loadOlderMessages), for: .touchUpInside)
         tableView.tableHeaderView = loadMoreBtn
+
+        typingLabel.backgroundColor = UIColor(red: 0.12, green: 0.12, blue: 0.16, alpha: 0.92)
+        typingLabel.textColor = UIColor(white: 0.55, alpha: 1)
+        typingLabel.font = UIFont.italicSystemFont(ofSize: 12)
+        typingLabel.isHidden = true
+        view.addSubview(typingLabel)
+        layoutTypingLabel()
+    }
+
+    private func layoutTypingLabel() {
+        let w = UIScreen.main.bounds.width
+        typingLabel.frame = CGRect(x: 12, y: inputBar.frame.minY - 18, width: w - 24, height: 18)
+        if !typingLabel.isHidden { view.bringSubviewToFront(typingLabel) }
     }
 
     // MARK: - Keyboard
@@ -152,6 +177,7 @@ class ChatVC: UIViewController {
         UIView.animate(withDuration: dur) {
             self.inputBar.frame  = CGRect(x: 0, y: h - self.inputH - kbH, width: w, height: self.inputH)
             self.tableView.frame = CGRect(x: 0, y: 0, width: w, height: h - self.inputH - kbH)
+            self.layoutTypingLabel()
         }
         scrollToBottom()
     }
@@ -164,6 +190,7 @@ class ChatVC: UIViewController {
         UIView.animate(withDuration: dur) {
             self.inputBar.frame  = CGRect(x: 0, y: h - self.inputH, width: w, height: self.inputH)
             self.tableView.frame = CGRect(x: 0, y: 0, width: w, height: h - self.inputH)
+            self.layoutTypingLabel()
         }
     }
 
@@ -201,16 +228,26 @@ class ChatVC: UIViewController {
     }
 
     private func handleEvent(_ json: [String: Any]) {
-        let evType = json["type"] as? String ?? "(none)"
-        let evCh   = json["channel"] as? String ?? "?"
-        StoatDebug.log("event: type=\(evType) ch=\(evCh)")
-        guard let type = json["type"] as? String, type == "Message",
-              let chId = json["channel"] as? String, chId == channel.id else { return }
+        guard let type = json["type"] as? String else { return }
+        StoatDebug.log("event: type=\(type) ch=\(json["channel"] as? String ?? json["id"] as? String ?? "?")")
+        switch type {
+        case "Message":            handleNewMessage(json)
+        case "MessageUpdate":      handleMessageUpdate(json)
+        case "MessageDelete":      handleMessageDelete(json)
+        case "ChannelStartTyping": handleTyping(json, started: true)
+        case "ChannelStopTyping":  handleTyping(json, started: false)
+        default:                   break
+        }
+    }
+
+    private func handleNewMessage(_ json: [String: Any]) {
+        guard let chId = json["channel"] as? String, chId == channel.id else { return }
         guard let msg = StoatMessage.from(dict: json) else {
             StoatDebug.log("event: Message parse failed keys=\(Array(json.keys))")
             return
         }
         guard !messages.contains(where: { $0.id == msg.id }) else { return }
+        removeTyping(msg.authorId)   // sending a message implicitly stops typing
         messages.append(msg)
         emptyLabel.isHidden = true
         tableView.insertRows(at: [IndexPath(row: messages.count - 1, section: 0)], with: .none)
@@ -222,6 +259,105 @@ class ChatVC: UIViewController {
                 }
             }
         }
+    }
+
+    private func handleMessageUpdate(_ json: [String: Any]) {
+        guard let chId = json["channel"] as? String, chId == channel.id,
+              let mid  = json["id"] as? String,
+              let data = json["data"] as? [String: Any],
+              let idx  = messages.firstIndex(where: { $0.id == mid }) else { return }
+        if let newContent = data["content"] as? String { messages[idx].content = newContent }
+        if data["edited"] != nil { messages[idx].edited = true }
+        tableView.reloadRows(at: [IndexPath(row: idx, section: 0)], with: .none)
+    }
+
+    private func handleMessageDelete(_ json: [String: Any]) {
+        guard let chId = json["channel"] as? String, chId == channel.id,
+              let mid  = json["id"] as? String,
+              let idx  = messages.firstIndex(where: { $0.id == mid }) else { return }
+        messages.remove(at: idx)
+        // reloadData (not deleteRows) so the following message re-evaluates grouping/separator
+        // now that its predecessor changed.
+        tableView.reloadData()
+        emptyLabel.isHidden = !messages.isEmpty
+    }
+
+    // MARK: - Typing indicator (receive)
+
+    private func handleTyping(_ json: [String: Any], started: Bool) {
+        let chId = json["id"] as? String ?? json["channel"] as? String
+        guard chId == channel.id,
+              let uid = json["user"] as? String,
+              uid != StoatSocket.shared.currentUser?.id else { return }
+        if started { addTyping(uid) } else { removeTyping(uid) }
+    }
+
+    private func addTyping(_ uid: String) {
+        typingUserIds.insert(uid)
+        typingTimers[uid]?.invalidate()
+        let t = Timer(timeInterval: 8, target: self, selector: #selector(typingTimedOut(_:)),
+                      userInfo: uid, repeats: false)
+        RunLoop.main.add(t, forMode: .common)
+        typingTimers[uid] = t
+        if StoatSocket.shared.allUsers[uid] == nil {
+            APIClient.get("/users/\(uid)") { [weak self] json, _ in
+                if let dict = json as? [String: Any], let u = StoatUser.from(dict: dict) {
+                    StoatSocket.shared.cacheUser(u); self?.updateTypingLabel()
+                }
+            }
+        }
+        updateTypingLabel()
+    }
+
+    private func removeTyping(_ uid: String) {
+        guard typingUserIds.contains(uid) else { return }
+        typingUserIds.remove(uid)
+        typingTimers[uid]?.invalidate(); typingTimers[uid] = nil
+        updateTypingLabel()
+    }
+
+    @objc private func typingTimedOut(_ t: Timer) {
+        if let uid = t.userInfo as? String { removeTyping(uid) }
+    }
+
+    private func updateTypingLabel() {
+        let names = typingUserIds.compactMap { StoatSocket.shared.allUsers[$0]?.username }
+        let text: String
+        switch typingUserIds.count {
+        case 0:  text = ""
+        case 1:  text = "\(names.first ?? "Someone") is typing…"
+        case 2 where names.count == 2:
+                 text = "\(names[0]) and \(names[1]) are typing…"
+        default: text = "Several people are typing…"
+        }
+        typingLabel.text = text
+        typingLabel.isHidden = text.isEmpty
+        layoutTypingLabel()
+    }
+
+    // MARK: - Typing indicator (send)
+
+    @objc private func textChanged() {
+        let empty = (textField.text ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        if empty { stopTypingSend(); return }
+        if !sentTyping {
+            StoatSocket.shared.sendJSON(["type": "BeginTyping", "channel": channel.id])
+            sentTyping = true
+        }
+        typingIdleTimer?.invalidate()
+        let t = Timer(timeInterval: 4, target: self, selector: #selector(typingIdle),
+                      userInfo: nil, repeats: false)
+        RunLoop.main.add(t, forMode: .common)
+        typingIdleTimer = t
+    }
+
+    @objc private func typingIdle() { stopTypingSend() }
+
+    private func stopTypingSend() {
+        typingIdleTimer?.invalidate(); typingIdleTimer = nil
+        guard sentTyping else { return }
+        StoatSocket.shared.sendJSON(["type": "EndTyping", "channel": channel.id])
+        sentTyping = false
     }
 
     private func scrollToBottom(animated: Bool = true) {
@@ -324,6 +460,7 @@ class ChatVC: UIViewController {
         let text = textField.text?.trimmingCharacters(in: .whitespaces) ?? ""
         guard !text.isEmpty || pendingAttachId != nil else { return }
         textField.text = ""
+        stopTypingSend()
 
         var payload: [String: Any] = ["content": text, "replies": []]
         if let aid = pendingAttachId {
@@ -348,17 +485,56 @@ class ChatVC: UIViewController {
         }
     }
 
+    // MARK: - Grouping & date separators
+
+    private static let daySepFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMMM d, yyyy"; return f
+    }()
+
+    // Calendar day key (yyyymmdd) via NSCalendar.components — iOS 2+ safe
+    // (Calendar.isDate(_:inSameDayAs:) / component(_:from:) are iOS 8+).
+    private func dayKey(_ d: Date) -> Int {
+        let c = (Calendar.current as NSCalendar).components([.year, .month, .day], from: d)
+        return (c.year ?? 0) * 10000 + (c.month ?? 0) * 100 + (c.day ?? 0)
+    }
+
+    private func dayLabel(_ d: Date) -> String {
+        let k = dayKey(d)
+        if k == dayKey(Date())                              { return "Today" }
+        if k == dayKey(Date(timeIntervalSinceNow: -86400))  { return "Yesterday" }
+        return ChatVC.daySepFmt.string(from: d)
+    }
+
+    /// Returns the separator text to show ABOVE this row, or nil if none (same day as prev).
+    private func daySeparatorText(at idx: Int) -> String? {
+        guard idx >= 0, idx < messages.count, let d = messages[idx].timestamp else { return nil }
+        if idx == 0 { return dayLabel(d) }
+        guard let pd = messages[idx - 1].timestamp else { return dayLabel(d) }
+        return dayKey(d) != dayKey(pd) ? dayLabel(d) : nil
+    }
+
+    /// True when this row continues a group: same author as prev, within 5 min, same day.
+    private func isGrouped(at idx: Int) -> Bool {
+        guard idx > 0, idx < messages.count else { return false }
+        let msg = messages[idx], prev = messages[idx - 1]
+        guard prev.authorId == msg.authorId,
+              let d = msg.timestamp, let pd = prev.timestamp,
+              d.timeIntervalSince(pd) < 300 else { return false }
+        return daySeparatorText(at: idx) == nil
+    }
+
     // MARK: - Row height
 
     private static let sizer: UILabel = {
         let l = UILabel(); l.font = UIFont.systemFont(ofSize: 14); l.numberOfLines = 0; return l
     }()
 
-    fileprivate static func rowHeight(for msg: StoatMessage) -> CGFloat {
+    fileprivate static func rowHeight(for msg: StoatMessage, grouped: Bool, separator: Bool) -> CGFloat {
         let w = UIScreen.main.bounds.width - 24
-        sizer.text = msg.content.isEmpty ? " " : msg.content
+        let base = msg.content.isEmpty ? " " : msg.content
+        sizer.text = base + (msg.edited ? "  (edited)" : "")
         let textH = ceil(sizer.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude)).height)
-        var h = max(56, textH + 42)
+        var h = grouped ? max(30, textH + 18) : max(56, textH + 42)
         if let att = msg.attachments.first, att.isImage {
             if att.width > 0 {
                 h += min(220, CGFloat(att.height) * w / CGFloat(att.width)) + 8
@@ -366,6 +542,7 @@ class ChatVC: UIViewController {
                 h += 180
             }
         }
+        if separator { h += 30 }
         return h
     }
 }
@@ -387,7 +564,9 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "msg", for: indexPath) as! MessageCell
         let msg = messages[indexPath.row]
-        cell.configure(with: msg)
+        cell.configure(with: msg,
+                       grouped: isGrouped(at: indexPath.row),
+                       separatorText: daySeparatorText(at: indexPath.row))
         cell.onImageTap = { [weak self] img in
             let viewer = ImageViewerVC(image: img)
             self?.navigationController?.pushViewController(viewer, animated: true)
@@ -396,7 +575,9 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
-        return ChatVC.rowHeight(for: messages[indexPath.row])
+        return ChatVC.rowHeight(for: messages[indexPath.row],
+                                grouped: isGrouped(at: indexPath.row),
+                                separator: daySeparatorText(at: indexPath.row) != nil)
     }
 
     func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
@@ -442,6 +623,8 @@ private class MessageCell: UITableViewCell {
     private let timeLbl    = UILabel()
     private let contentLbl = UILabel()
     private let attachImg  = UIImageView()
+    private let dateLbl    = UILabel()
+    private let sepLine    = UIView()
     private var currentAttachId: String?
     var onImageTap: ((UIImage) -> Void)?
     var detectedURLs: [NSURL] = []
@@ -499,6 +682,18 @@ private class MessageCell: UITableViewCell {
 
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
         contentView.addGestureRecognizer(longPress)
+
+        // Date separator: a hairline with a centered date label that "breaks" the line
+        sepLine.backgroundColor = UIColor(white: 1, alpha: 0.09)
+        sepLine.isHidden = true
+        contentView.addSubview(sepLine)
+
+        dateLbl.backgroundColor = MessageCell.cellBg
+        dateLbl.textColor = UIColor(white: 0.5, alpha: 1)
+        dateLbl.font = UIFont.boldSystemFont(ofSize: 11)
+        dateLbl.textAlignment = .center
+        dateLbl.isHidden = true
+        contentView.addSubview(dateLbl)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -528,22 +723,52 @@ private class MessageCell: UITableViewCell {
         UIApplication.shared.openURL(url as URL)
     }
 
-    func configure(with msg: StoatMessage) {
+    func configure(with msg: StoatMessage, grouped: Bool, separatorText: String?) {
         rawText = msg.content
-        let w = UIScreen.main.bounds.width - 24
-        authorLbl.text  = msg.authorName
-        authorLbl.frame = CGRect(x: 12, y: 8, width: w - 52, height: 16)
+        let sw = UIScreen.main.bounds.width
+        let w  = sw - 24
+        let sepH: CGFloat = separatorText != nil ? 30 : 0
 
-        timeLbl.text  = msg.timestamp.map { MessageCell.formatTime($0) } ?? ""
-        timeLbl.frame = CGRect(x: UIScreen.main.bounds.width - 52, y: 10, width: 48, height: 12)
+        // Date separator
+        if let sepText = separatorText {
+            dateLbl.text = sepText
+            dateLbl.sizeToFit()
+            let dw = dateLbl.frame.width + 16
+            dateLbl.frame = CGRect(x: (sw - dw) / 2, y: 5, width: dw, height: 18)
+            sepLine.frame = CGRect(x: 16, y: 14, width: sw - 32, height: 1)
+            dateLbl.isHidden = false
+            sepLine.isHidden = false
+        } else {
+            dateLbl.isHidden = true
+            sepLine.isHidden = true
+        }
+
+        // Author + time only shown on the first message of a group
+        if grouped {
+            authorLbl.isHidden = true
+            timeLbl.isHidden   = true
+        } else {
+            authorLbl.isHidden = false
+            timeLbl.isHidden   = false
+            authorLbl.text  = msg.authorName
+            authorLbl.frame = CGRect(x: 12, y: sepH + 8, width: w - 52, height: 16)
+            timeLbl.text  = msg.timestamp.map { MessageCell.formatTime($0) } ?? ""
+            timeLbl.frame = CGRect(x: sw - 52, y: sepH + 10, width: 48, height: 12)
+        }
 
         let (attrStr, urls) = MessageCell.format(msg.content)
-        contentLbl.attributedText = attrStr
+        let display = NSMutableAttributedString(attributedString: attrStr)
+        if msg.edited {
+            display.append(NSAttributedString(string: "  (edited)", attributes: [
+                NSAttributedString.Key.foregroundColor: UIColor(white: 0.4, alpha: 1),
+                NSAttributedString.Key.font: UIFont.systemFont(ofSize: 11)]))
+        }
+        contentLbl.attributedText = display
         detectedURLs = urls
         contentLbl.isUserInteractionEnabled = !urls.isEmpty
-        let textH = msg.content.isEmpty ? 0 :
+        let textH = (msg.content.isEmpty && !msg.edited) ? 0 :
             ceil(contentLbl.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude)).height)
-        contentLbl.frame = CGRect(x: 12, y: 28, width: w, height: textH)
+        contentLbl.frame = CGRect(x: 12, y: sepH + (grouped ? 6 : 28), width: w, height: textH)
 
         // Reset attachment
         currentAttachId = nil

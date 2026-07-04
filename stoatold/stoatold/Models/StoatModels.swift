@@ -104,10 +104,11 @@ struct StoatMessage {
     let id:          String
     let channelId:   String
     let authorId:    String
-    let content:     String
+    var content:     String
     let displayName: String?
     let timestamp:   Date?
     let attachments: [StoatAttachment]
+    var edited:      Bool = false
 
     var authorName: String {
         if let n = displayName { return n }
@@ -173,9 +174,10 @@ struct StoatMessage {
             StoatDebug.log("msg: attachments unexpected type: \(type(of: raw))")
         }
 
+        let edited = dict["edited"] != nil
         return StoatMessage(id: id, channelId: channel, authorId: authorId,
                             content: content, displayName: displayName,
-                            timestamp: timestamp, attachments: attachments)
+                            timestamp: timestamp, attachments: attachments, edited: edited)
     }
 
     // Crockford base32 decode of ULID timestamp (first 10 chars = 48-bit ms)
