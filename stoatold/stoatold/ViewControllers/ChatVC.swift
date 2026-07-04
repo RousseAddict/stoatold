@@ -24,6 +24,13 @@ class ChatVC: UIViewController {
     private var sentTyping      = false
     private var typingIdleTimer: Timer?
 
+    // Edit mode
+    private let editBar       = UIView()
+    private let editLabel     = UILabel()
+    private let editCancelBtn = UIButton(type: .custom)
+    private var editingMessageId: String?
+    private var pendingDeleteId:  String?
+
     private lazy var baseH: CGFloat = UIScreen.main.bounds.height - 64
 
     init(channel: StoatChannel) {
@@ -156,12 +163,36 @@ class ChatVC: UIViewController {
         typingLabel.isHidden = true
         view.addSubview(typingLabel)
         layoutTypingLabel()
+
+        // Edit banner (shown above input bar while editing a message)
+        editBar.backgroundColor = UIColor(red: 0.18, green: 0.18, blue: 0.24, alpha: 1)
+        editBar.isHidden = true
+        editLabel.backgroundColor = .clear
+        editLabel.textColor = UIColor(white: 0.7, alpha: 1)
+        editLabel.font = UIFont.systemFont(ofSize: 12)
+        editLabel.text = "Editing message"
+        editBar.addSubview(editLabel)
+        editCancelBtn.setTitle("\u{2715} Cancel", for: .normal)
+        editCancelBtn.setTitleColor(UIColor(red: 0.90, green: 0.45, blue: 0.45, alpha: 1), for: .normal)
+        editCancelBtn.titleLabel?.font = UIFont.systemFont(ofSize: 12)
+        editCancelBtn.addTarget(self, action: #selector(cancelEdit), for: .touchUpInside)
+        editBar.addSubview(editCancelBtn)
+        view.addSubview(editBar)
+        layoutEditBar()
     }
 
     private func layoutTypingLabel() {
         let w = UIScreen.main.bounds.width
         typingLabel.frame = CGRect(x: 12, y: inputBar.frame.minY - 18, width: w - 24, height: 18)
         if !typingLabel.isHidden { view.bringSubviewToFront(typingLabel) }
+    }
+
+    private func layoutEditBar() {
+        let w = UIScreen.main.bounds.width
+        editBar.frame       = CGRect(x: 0, y: inputBar.frame.minY - 30, width: w, height: 30)
+        editLabel.frame     = CGRect(x: 12, y: 0, width: w - 100, height: 30)
+        editCancelBtn.frame = CGRect(x: w - 92, y: 0, width: 80, height: 30)
+        if !editBar.isHidden { view.bringSubviewToFront(editBar) }
     }
 
     // MARK: - Keyboard
@@ -178,6 +209,7 @@ class ChatVC: UIViewController {
             self.inputBar.frame  = CGRect(x: 0, y: h - self.inputH - kbH, width: w, height: self.inputH)
             self.tableView.frame = CGRect(x: 0, y: 0, width: w, height: h - self.inputH - kbH)
             self.layoutTypingLabel()
+            self.layoutEditBar()
         }
         scrollToBottom()
     }
@@ -191,6 +223,7 @@ class ChatVC: UIViewController {
             self.inputBar.frame  = CGRect(x: 0, y: h - self.inputH, width: w, height: self.inputH)
             self.tableView.frame = CGRect(x: 0, y: 0, width: w, height: h - self.inputH)
             self.layoutTypingLabel()
+            self.layoutEditBar()
         }
     }
 
@@ -338,6 +371,7 @@ class ChatVC: UIViewController {
     // MARK: - Typing indicator (send)
 
     @objc private func textChanged() {
+        if editingMessageId != nil { return }   // no typing broadcasts while editing
         let empty = (textField.text ?? "").trimmingCharacters(in: .whitespaces).isEmpty
         if empty { stopTypingSend(); return }
         if !sentTyping {
@@ -358,6 +392,72 @@ class ChatVC: UIViewController {
         guard sentTyping else { return }
         StoatSocket.shared.sendJSON(["type": "EndTyping", "channel": channel.id])
         sentTyping = false
+    }
+
+    // MARK: - Edit / delete own message
+
+    private func beginEdit(messageId: String, content: String) {
+        stopTypingSend()
+        editingMessageId = messageId
+        textField.text = content
+        typingLabel.isHidden = true
+        editBar.isHidden = false
+        sendBtn.setTitle("\u{2713}", for: .normal)   // ✓ save
+        layoutEditBar()
+        textField.becomeFirstResponder()
+    }
+
+    private func endEditMode() {
+        editingMessageId = nil
+        textField.text = ""
+        editBar.isHidden = true
+        sendBtn.setTitle("\u{2191}", for: .normal)   // ↑ send
+    }
+
+    @objc private func cancelEdit() { endEditMode() }
+
+    private func saveEdit(_ mid: String, content: String) {
+        guard let token = APIClient.sessionToken,
+              let body  = try? JSONSerialization.data(withJSONObject: ["content": content]) else { return }
+        HTTPClient.request("\(APIClient.baseURL)/channels/\(channel.id)/messages/\(mid)",
+                           method: "PATCH", headers: ["x-session-token": token], body: body) { [weak self] _, status, err in
+            guard let self = self else { return }
+            if let err = err { StoatDebug.log("chat: edit error: \(err.localizedDescription)"); return }
+            StoatDebug.log("chat: edit status=\(status)")
+            // Optimistic local update; server MessageUpdate reconciles + marks edited.
+            if let idx = self.messages.firstIndex(where: { $0.id == mid }) {
+                self.messages[idx].content = content
+                self.messages[idx].edited  = true
+                self.tableView.reloadRows(at: [IndexPath(row: idx, section: 0)], with: .none)
+            }
+        }
+    }
+
+    private func confirmDelete(_ mid: String) {
+        pendingDeleteId = mid
+        // Build via property/addButton API — the Swift variadic
+        // UIAlertView(…otherButtonTitles:) initializer crashes at bind time on iOS 6.
+        let a = UIAlertView()
+        a.title    = "Delete message?"
+        a.delegate = self
+        a.addButton(withTitle: "Cancel")   // index 0
+        a.addButton(withTitle: "Delete")   // index 1
+        a.cancelButtonIndex = 0
+        a.show()
+    }
+
+    private func deleteMessage(_ mid: String) {
+        guard let token = APIClient.sessionToken else { return }
+        HTTPClient.request("\(APIClient.baseURL)/channels/\(channel.id)/messages/\(mid)",
+                           method: "DELETE", headers: ["x-session-token": token]) { [weak self] _, status, _ in
+            guard let self = self, status == 204 || status == 200 else { return }
+            if self.editingMessageId == mid { self.endEditMode() }
+            if let idx = self.messages.firstIndex(where: { $0.id == mid }) {
+                self.messages.remove(at: idx)
+                self.tableView.reloadData()   // recompute neighbour grouping/separators
+                self.emptyLabel.isHidden = !self.messages.isEmpty
+            }
+        }
     }
 
     private func scrollToBottom(animated: Bool = true) {
@@ -458,6 +558,12 @@ class ChatVC: UIViewController {
 
     @objc private func sendTapped() {
         let text = textField.text?.trimmingCharacters(in: .whitespaces) ?? ""
+        if let mid = editingMessageId {
+            guard !text.isEmpty else { return }   // empty edit → ignore (use Cancel to abort)
+            endEditMode()
+            saveEdit(mid, content: text)
+            return
+        }
         guard !text.isEmpty || pendingAttachId != nil else { return }
         textField.text = ""
         stopTypingSend()
@@ -553,6 +659,16 @@ extension ChatVC: UITextFieldDelegate {
     func textFieldShouldReturn(_ textField: UITextField) -> Bool { sendTapped(); return false }
 }
 
+// MARK: - UIAlertViewDelegate (delete confirmation)
+
+extension ChatVC: UIAlertViewDelegate {
+    func alertView(_ alertView: UIAlertView, clickedButtonAt buttonIndex: Int) {
+        let mid = pendingDeleteId
+        pendingDeleteId = nil
+        if buttonIndex == 1, let mid = mid { deleteMessage(mid) }   // 1 = "Delete"
+    }
+}
+
 // MARK: - UITableViewDataSource / Delegate
 
 extension ChatVC: UITableViewDataSource, UITableViewDelegate {
@@ -567,6 +683,10 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
         cell.configure(with: msg,
                        grouped: isGrouped(at: indexPath.row),
                        separatorText: daySeparatorText(at: indexPath.row))
+        cell.isOwn = (msg.authorId == StoatSocket.shared.currentUser?.id)
+        let mid = msg.id, content = msg.content
+        cell.onEdit   = { [weak self] in self?.beginEdit(messageId: mid, content: content) }
+        cell.onDelete = { [weak self] in self?.confirmDelete(mid) }
         cell.onImageTap = { [weak self] img in
             let viewer = ImageViewerVC(image: img)
             self?.navigationController?.pushViewController(viewer, animated: true)
@@ -580,25 +700,6 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
                                 separator: daySeparatorText(at: indexPath.row) != nil)
     }
 
-    func tableView(_ tableView: UITableView, canEditRowAt indexPath: IndexPath) -> Bool {
-        return messages[indexPath.row].authorId == StoatSocket.shared.currentUser?.id
-    }
-
-    func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle,
-                   forRowAt indexPath: IndexPath) {
-        guard editingStyle == .delete,
-              let token = APIClient.sessionToken else { return }
-        let msg = messages[indexPath.row]
-        HTTPClient.request("\(APIClient.baseURL)/channels/\(channel.id)/messages/\(msg.id)",
-                           method: "DELETE",
-                           headers: ["x-session-token": token]) { [weak self] _, status, _ in
-            guard let self = self else { return }
-            if status == 204 || status == 200 {
-                self.messages.remove(at: indexPath.row)
-                self.tableView.deleteRows(at: [indexPath], with: .fade)
-            }
-        }
-    }
 }
 
 // MARK: - UIImagePickerControllerDelegate
@@ -627,6 +728,9 @@ private class MessageCell: UITableViewCell {
     private let sepLine    = UIView()
     private var currentAttachId: String?
     var onImageTap: ((UIImage) -> Void)?
+    var onEdit:     (() -> Void)?
+    var onDelete:   (() -> Void)?
+    var isOwn = false
     var detectedURLs: [NSURL] = []
     private var rawText = ""
 
@@ -701,18 +805,34 @@ private class MessageCell: UITableViewCell {
     override var canBecomeFirstResponder: Bool { return true }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        return action == #selector(copy(_:)) && !rawText.isEmpty
+        if action == #selector(copy(_:))     { return !rawText.isEmpty }
+        if action == #selector(editMsg(_:))  { return isOwn && !rawText.isEmpty }
+        if action == #selector(deleteMsg(_:)) { return isOwn }
+        return false
     }
 
     override func copy(_ sender: Any?) {
         UIPasteboard.general.string = rawText
     }
 
+    @objc private func editMsg(_ sender: Any?)   { onEdit?() }
+    @objc private func deleteMsg(_ sender: Any?) { onDelete?() }
+
     @objc private func longPressed(_ gr: UILongPressGestureRecognizer) {
-        guard gr.state == .began, !rawText.isEmpty else { return }
+        guard gr.state == .began else { return }
+        guard !rawText.isEmpty || isOwn else { return }   // nothing actionable
         becomeFirstResponder()
+        var items: [UIMenuItem] = []
+        if isOwn && !rawText.isEmpty {
+            items.append(UIMenuItem(title: "Edit", action: #selector(editMsg(_:))))
+        }
+        if isOwn {
+            items.append(UIMenuItem(title: "Delete", action: #selector(deleteMsg(_:))))
+        }
         let menu = UIMenuController.shared
-        menu.setTargetRect(contentLbl.frame, in: contentView)
+        menu.menuItems = items.isEmpty ? nil : items
+        let rect = rawText.isEmpty ? attachImg.frame : contentLbl.frame
+        menu.setTargetRect(rect, in: contentView)
         menu.setMenuVisible(true, animated: true)
     }
 
