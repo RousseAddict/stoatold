@@ -109,6 +109,7 @@ struct StoatMessage {
     let timestamp:   Date?
     let attachments: [StoatAttachment]
     var edited:      Bool = false
+    let replies:     [String]
 
     var authorName: String {
         if let n = displayName { return n }
@@ -175,9 +176,11 @@ struct StoatMessage {
         }
 
         let edited = dict["edited"] != nil
+        let replies = dict["replies"] as? [String] ?? []
         return StoatMessage(id: id, channelId: channel, authorId: authorId,
                             content: content, displayName: displayName,
-                            timestamp: timestamp, attachments: attachments, edited: edited)
+                            timestamp: timestamp, attachments: attachments,
+                            edited: edited, replies: replies)
     }
 
     // Crockford base32 decode of ULID timestamp (first 10 chars = 48-bit ms)

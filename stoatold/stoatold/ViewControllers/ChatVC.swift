@@ -31,6 +31,12 @@ class ChatVC: UIViewController {
     private var editingMessageId: String?
     private var pendingDeleteId:  String?
 
+    // Reply mode
+    private let replyBar       = UIView()
+    private let replyLabel     = UILabel()
+    private let replyCancelBtn = UIButton(type: .custom)
+    private var replyingToId:  String?
+
     private lazy var baseH: CGFloat = UIScreen.main.bounds.height - 64
 
     init(channel: StoatChannel) {
@@ -179,6 +185,21 @@ class ChatVC: UIViewController {
         editBar.addSubview(editCancelBtn)
         view.addSubview(editBar)
         layoutEditBar()
+
+        // Reply banner (shown above input bar while replying to a message)
+        replyBar.backgroundColor = UIColor(red: 0.16, green: 0.18, blue: 0.24, alpha: 1)
+        replyBar.isHidden = true
+        replyLabel.backgroundColor = .clear
+        replyLabel.textColor = UIColor(white: 0.7, alpha: 1)
+        replyLabel.font = UIFont.systemFont(ofSize: 12)
+        replyBar.addSubview(replyLabel)
+        replyCancelBtn.setTitle("\u{2715} Cancel", for: .normal)
+        replyCancelBtn.setTitleColor(UIColor(red: 0.90, green: 0.45, blue: 0.45, alpha: 1), for: .normal)
+        replyCancelBtn.titleLabel?.font = UIFont.systemFont(ofSize: 12)
+        replyCancelBtn.addTarget(self, action: #selector(cancelReply), for: .touchUpInside)
+        replyBar.addSubview(replyCancelBtn)
+        view.addSubview(replyBar)
+        layoutReplyBar()
     }
 
     private func layoutTypingLabel() {
@@ -193,6 +214,14 @@ class ChatVC: UIViewController {
         editLabel.frame     = CGRect(x: 12, y: 0, width: w - 100, height: 30)
         editCancelBtn.frame = CGRect(x: w - 92, y: 0, width: 80, height: 30)
         if !editBar.isHidden { view.bringSubviewToFront(editBar) }
+    }
+
+    private func layoutReplyBar() {
+        let w = UIScreen.main.bounds.width
+        replyBar.frame       = CGRect(x: 0, y: inputBar.frame.minY - 30, width: w, height: 30)
+        replyLabel.frame     = CGRect(x: 12, y: 0, width: w - 100, height: 30)
+        replyCancelBtn.frame = CGRect(x: w - 92, y: 0, width: 80, height: 30)
+        if !replyBar.isHidden { view.bringSubviewToFront(replyBar) }
     }
 
     // MARK: - Keyboard
@@ -210,6 +239,7 @@ class ChatVC: UIViewController {
             self.tableView.frame = CGRect(x: 0, y: 0, width: w, height: h - self.inputH - kbH)
             self.layoutTypingLabel()
             self.layoutEditBar()
+            self.layoutReplyBar()
         }
         scrollToBottom()
     }
@@ -224,6 +254,7 @@ class ChatVC: UIViewController {
             self.tableView.frame = CGRect(x: 0, y: 0, width: w, height: h - self.inputH)
             self.layoutTypingLabel()
             self.layoutEditBar()
+            self.layoutReplyBar()
         }
     }
 
@@ -398,6 +429,7 @@ class ChatVC: UIViewController {
 
     private func beginEdit(messageId: String, content: String) {
         stopTypingSend()
+        if replyingToId != nil { endReplyMode() }
         editingMessageId = messageId
         textField.text = content
         typingLabel.isHidden = true
@@ -415,6 +447,46 @@ class ChatVC: UIViewController {
     }
 
     @objc private func cancelEdit() { endEditMode() }
+
+    // MARK: - Reply
+
+    private func beginReply(messageId: String, author: String, preview: String) {
+        if editingMessageId != nil { endEditMode() }
+        replyingToId = messageId
+        replyLabel.text = "Replying to \(author): \(preview)"
+        replyBar.isHidden = false
+        layoutReplyBar()
+        textField.becomeFirstResponder()
+    }
+
+    private func endReplyMode() {
+        replyingToId = nil
+        replyBar.isHidden = true
+    }
+
+    @objc private func cancelReply() { endReplyMode() }
+
+    /// Short one-line preview of a message's content for reply banners/labels.
+    fileprivate static func previewText(_ content: String, attachment: Bool) -> String {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return attachment ? "[image]" : "[no text]" }
+        let oneLine = trimmed.replacingOccurrences(of: "\n", with: " ")
+        if oneLine.count > 60 {
+            let idx = oneLine.index(oneLine.startIndex, offsetBy: 60)
+            return String(oneLine[..<idx]) + "\u{2026}"
+        }
+        return oneLine
+    }
+
+    /// The "↱ author: preview" line to show above a message that is a reply, or nil.
+    private func replyDisplay(for msg: StoatMessage) -> String? {
+        guard let rid = msg.replies.first else { return nil }
+        if let target = messages.first(where: { $0.id == rid }) {
+            let preview = ChatVC.previewText(target.content, attachment: !target.attachments.isEmpty)
+            return "\u{21B1} \(target.authorName): \(preview)"
+        }
+        return "\u{21B1} Reply"
+    }
 
     private func saveEdit(_ mid: String, content: String) {
         guard let token = APIClient.sessionToken,
@@ -568,7 +640,12 @@ class ChatVC: UIViewController {
         textField.text = ""
         stopTypingSend()
 
-        var payload: [String: Any] = ["content": text, "replies": []]
+        var replies: [[String: Any]] = []
+        if let rid = replyingToId {
+            replies = [["id": rid, "mention": false]]
+            endReplyMode()
+        }
+        var payload: [String: Any] = ["content": text, "replies": replies]
         if let aid = pendingAttachId {
             payload["attachments"] = [aid]
             pendingAttachId = nil
@@ -635,7 +712,7 @@ class ChatVC: UIViewController {
         let l = UILabel(); l.font = UIFont.systemFont(ofSize: 14); l.numberOfLines = 0; return l
     }()
 
-    fileprivate static func rowHeight(for msg: StoatMessage, grouped: Bool, separator: Bool) -> CGFloat {
+    fileprivate static func rowHeight(for msg: StoatMessage, grouped: Bool, separator: Bool, hasReply: Bool) -> CGFloat {
         let w = UIScreen.main.bounds.width - 24
         let base = msg.content.isEmpty ? " " : msg.content
         sizer.text = base + (msg.edited ? "  (edited)" : "")
@@ -649,6 +726,7 @@ class ChatVC: UIViewController {
             }
         }
         if separator { h += 30 }
+        if hasReply  { h += 18 }
         return h
     }
 }
@@ -682,11 +760,15 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
         let msg = messages[indexPath.row]
         cell.configure(with: msg,
                        grouped: isGrouped(at: indexPath.row),
-                       separatorText: daySeparatorText(at: indexPath.row))
+                       separatorText: daySeparatorText(at: indexPath.row),
+                       replyPreview: replyDisplay(for: msg))
         cell.isOwn = (msg.authorId == StoatSocket.shared.currentUser?.id)
         let mid = msg.id, content = msg.content
+        let replyAuthor  = msg.authorName
+        let replyPreview = ChatVC.previewText(content, attachment: !msg.attachments.isEmpty)
         cell.onEdit   = { [weak self] in self?.beginEdit(messageId: mid, content: content) }
         cell.onDelete = { [weak self] in self?.confirmDelete(mid) }
+        cell.onReply  = { [weak self] in self?.beginReply(messageId: mid, author: replyAuthor, preview: replyPreview) }
         cell.onImageTap = { [weak self] img in
             let viewer = ImageViewerVC(image: img)
             self?.navigationController?.pushViewController(viewer, animated: true)
@@ -695,9 +777,11 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
-        return ChatVC.rowHeight(for: messages[indexPath.row],
+        let msg = messages[indexPath.row]
+        return ChatVC.rowHeight(for: msg,
                                 grouped: isGrouped(at: indexPath.row),
-                                separator: daySeparatorText(at: indexPath.row) != nil)
+                                separator: daySeparatorText(at: indexPath.row) != nil,
+                                hasReply: replyDisplay(for: msg) != nil)
     }
 
 }
@@ -726,10 +810,12 @@ private class MessageCell: UITableViewCell {
     private let attachImg  = UIImageView()
     private let dateLbl    = UILabel()
     private let sepLine    = UIView()
+    private let replyLbl   = UILabel()
     private var currentAttachId: String?
     var onImageTap: ((UIImage) -> Void)?
     var onEdit:     (() -> Void)?
     var onDelete:   (() -> Void)?
+    var onReply:    (() -> Void)?
     var isOwn = false
     var detectedURLs: [NSURL] = []
     private var rawText = ""
@@ -787,6 +873,18 @@ private class MessageCell: UITableViewCell {
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(longPressed(_:)))
         contentView.addGestureRecognizer(longPress)
 
+        // Swipe left on a message = reply to it
+        let swipe = UISwipeGestureRecognizer(target: self, action: #selector(swipedToReply))
+        swipe.direction = .left
+        contentView.addGestureRecognizer(swipe)
+
+        // Reply preview line shown above a message that is itself a reply
+        replyLbl.backgroundColor = .clear
+        replyLbl.textColor = UIColor(white: 0.5, alpha: 1)
+        replyLbl.font = UIFont.systemFont(ofSize: 11)
+        replyLbl.isHidden = true
+        contentView.addSubview(replyLbl)
+
         // Date separator: a hairline with a centered date label that "breaks" the line
         sepLine.backgroundColor = UIColor(white: 1, alpha: 0.09)
         sepLine.isHidden = true
@@ -836,6 +934,8 @@ private class MessageCell: UITableViewCell {
         menu.setMenuVisible(true, animated: true)
     }
 
+    @objc private func swipedToReply() { onReply?() }
+
     @objc private func imgTapped() { if let img = attachImg.image { onImageTap?(img) } }
 
     @objc private func urlTapped() {
@@ -843,7 +943,7 @@ private class MessageCell: UITableViewCell {
         UIApplication.shared.openURL(url as URL)
     }
 
-    func configure(with msg: StoatMessage, grouped: Bool, separatorText: String?) {
+    func configure(with msg: StoatMessage, grouped: Bool, separatorText: String?, replyPreview: String?) {
         rawText = msg.content
         let sw = UIScreen.main.bounds.width
         let w  = sw - 24
@@ -863,6 +963,16 @@ private class MessageCell: UITableViewCell {
             sepLine.isHidden = true
         }
 
+        // Reply preview (shown above the message when it replies to another)
+        let replyH: CGFloat = replyPreview != nil ? 18 : 0
+        if let rp = replyPreview {
+            replyLbl.text  = rp
+            replyLbl.frame = CGRect(x: 12, y: sepH + 2, width: w, height: 16)
+            replyLbl.isHidden = false
+        } else {
+            replyLbl.isHidden = true
+        }
+
         // Author + time only shown on the first message of a group
         if grouped {
             authorLbl.isHidden = true
@@ -871,9 +981,9 @@ private class MessageCell: UITableViewCell {
             authorLbl.isHidden = false
             timeLbl.isHidden   = false
             authorLbl.text  = msg.authorName
-            authorLbl.frame = CGRect(x: 12, y: sepH + 8, width: w - 52, height: 16)
+            authorLbl.frame = CGRect(x: 12, y: sepH + replyH + 8, width: w - 52, height: 16)
             timeLbl.text  = msg.timestamp.map { MessageCell.formatTime($0) } ?? ""
-            timeLbl.frame = CGRect(x: sw - 52, y: sepH + 10, width: 48, height: 12)
+            timeLbl.frame = CGRect(x: sw - 52, y: sepH + replyH + 10, width: 48, height: 12)
         }
 
         let (attrStr, urls) = MessageCell.format(msg.content)
@@ -888,7 +998,7 @@ private class MessageCell: UITableViewCell {
         contentLbl.isUserInteractionEnabled = !urls.isEmpty
         let textH = (msg.content.isEmpty && !msg.edited) ? 0 :
             ceil(contentLbl.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude)).height)
-        contentLbl.frame = CGRect(x: 12, y: sepH + (grouped ? 6 : 28), width: w, height: textH)
+        contentLbl.frame = CGRect(x: 12, y: sepH + replyH + (grouped ? 6 : 28), width: w, height: textH)
 
         // Reset attachment
         currentAttachId = nil
