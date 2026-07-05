@@ -37,6 +37,10 @@ class ChatVC: UIViewController {
     private let replyCancelBtn = UIButton(type: .custom)
     private var replyingToId:  String?
 
+    // Jump-to-bottom
+    private let jumpBtn   = UIButton(type: .custom)
+    private var unseenNew = false
+
     private lazy var baseH: CGFloat = UIScreen.main.bounds.height - 64
 
     init(channel: StoatChannel) {
@@ -200,6 +204,50 @@ class ChatVC: UIViewController {
         replyBar.addSubview(replyCancelBtn)
         view.addSubview(replyBar)
         layoutReplyBar()
+
+        // Jump-to-bottom pill (shown when scrolled up / new msg arrives off-screen)
+        jumpBtn.backgroundColor = UIColor(red: 0.18, green: 0.18, blue: 0.24, alpha: 0.95)
+        jumpBtn.setTitleColor(UIColor(red: 0.55, green: 0.70, blue: 0.98, alpha: 1), for: .normal)
+        jumpBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 13)
+        jumpBtn.contentEdgeInsets = UIEdgeInsets(top: 6, left: 14, bottom: 6, right: 14)
+        jumpBtn.layer.cornerRadius = 15
+        jumpBtn.layer.masksToBounds = true
+        jumpBtn.isHidden = true
+        jumpBtn.addTarget(self, action: #selector(jumpTapped), for: .touchUpInside)
+        view.addSubview(jumpBtn)
+        layoutJumpButton()
+    }
+
+    private func layoutJumpButton() {
+        let w = UIScreen.main.bounds.width
+        jumpBtn.sizeToFit()
+        let bw = jumpBtn.bounds.width
+        let bh: CGFloat = 30
+        jumpBtn.frame = CGRect(x: w - bw - 12,
+                               y: inputBar.frame.minY - bh - 24,
+                               width: bw, height: bh)
+    }
+
+    private func isNearBottom() -> Bool {
+        let off = tableView.contentOffset.y + tableView.bounds.height
+        return off >= tableView.contentSize.height - 80
+    }
+
+    private func updateJumpButton() {
+        if isNearBottom() {
+            unseenNew = false
+            jumpBtn.isHidden = true
+            return
+        }
+        jumpBtn.setTitle(unseenNew ? "\u{2193} New messages" : "\u{2193}", for: .normal)
+        jumpBtn.isHidden = false
+        layoutJumpButton()
+    }
+
+    @objc private func jumpTapped() {
+        unseenNew = false
+        jumpBtn.isHidden = true
+        scrollToBottom()
     }
 
     private func layoutTypingLabel() {
@@ -240,6 +288,7 @@ class ChatVC: UIViewController {
             self.layoutTypingLabel()
             self.layoutEditBar()
             self.layoutReplyBar()
+            self.layoutJumpButton()
         }
         scrollToBottom()
     }
@@ -255,6 +304,7 @@ class ChatVC: UIViewController {
             self.layoutTypingLabel()
             self.layoutEditBar()
             self.layoutReplyBar()
+            self.layoutJumpButton()
         }
     }
 
@@ -312,10 +362,16 @@ class ChatVC: UIViewController {
         }
         guard !messages.contains(where: { $0.id == msg.id }) else { return }
         removeTyping(msg.authorId)   // sending a message implicitly stops typing
+        let wasNearBottom = isNearBottom() || msg.authorId == StoatSocket.shared.currentUser?.id
         messages.append(msg)
         emptyLabel.isHidden = true
         tableView.insertRows(at: [IndexPath(row: messages.count - 1, section: 0)], with: .none)
-        scrollToBottom()
+        if wasNearBottom {
+            scrollToBottom()
+        } else {
+            unseenNew = true
+            updateJumpButton()
+        }
         if msg.displayName == nil && StoatSocket.shared.allUsers[msg.authorId] == nil {
             APIClient.get("/users/\(msg.authorId)") { [weak self] json, _ in
                 if let dict = json as? [String: Any], let u = StoatUser.from(dict: dict) {
@@ -714,7 +770,8 @@ class ChatVC: UIViewController {
 
     fileprivate static func rowHeight(for msg: StoatMessage, grouped: Bool, separator: Bool, hasReply: Bool) -> CGFloat {
         let w = UIScreen.main.bounds.width - 24
-        let base = msg.content.isEmpty ? " " : msg.content
+        let resolved = MessageCell.resolveMentions(msg.content).0
+        let base = resolved.isEmpty ? " " : resolved
         sizer.text = base + (msg.edited ? "  (edited)" : "")
         let textH = ceil(sizer.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude)).height)
         var h = grouped ? max(30, textH + 18) : max(56, textH + 42)
@@ -782,6 +839,10 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
                                 grouped: isGrouped(at: indexPath.row),
                                 separator: daySeparatorText(at: indexPath.row) != nil,
                                 hasReply: replyDisplay(for: msg) != nil)
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        updateJumpButton()
     }
 
 }
@@ -1029,7 +1090,8 @@ private class MessageCell: UITableViewCell {
         let italFont  = UIFont.italicSystemFont(ofSize: 14)
         let codeFont  = UIFont(name: "Courier", size: 13) ?? baseFont
         let textColor = UIColor(white: 0.85, alpha: 1)
-        let result = NSMutableAttributedString(string: text, attributes: [
+        let (resolved, mentionRanges) = resolveMentions(text)
+        let result = NSMutableAttributedString(string: resolved, attributes: [
             NSAttributedString.Key.foregroundColor: textColor,
             NSAttributedString.Key.font: baseFont,
         ])
@@ -1065,7 +1127,42 @@ private class MessageCell: UITableViewCell {
                 if let u = m.url { urls.append(u as NSURL) }
             }
         }
+        // Highlight resolved @mentions (applied last so it wins over link coloring)
+        let mentionColor = UIColor(red: 0.36, green: 0.56, blue: 0.90, alpha: 1)
+        let len = (result.string as NSString).length
+        for r in mentionRanges where r.location + r.length <= len {
+            result.addAttribute(.foregroundColor, value: mentionColor, range: r)
+            result.addAttribute(.font, value: boldFont, range: r)
+        }
         return (result, urls)
+    }
+
+    // Resolve <@userId> tokens to "@username", returning the rewritten string
+    // and the NSRanges (UTF-16) of each inserted @mention for highlighting.
+    fileprivate static func resolveMentions(_ text: String) -> (String, [NSRange]) {
+        guard text.range(of: "<@") != nil,
+              let re = try? NSRegularExpression(pattern: "<@([0-9A-Za-z]+)>", options: []) else {
+            return (text, [])
+        }
+        let ns = text as NSString
+        let matches = re.matches(in: text, options: [],
+                                 range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return (text, []) }
+        let out = NSMutableString()
+        var ranges: [NSRange] = []
+        var last = 0
+        for m in matches {
+            let full = m.range
+            out.append(ns.substring(with: NSRange(location: last, length: full.location - last)))
+            let uid   = ns.substring(with: m.range(at: 1))
+            let uname = StoatSocket.shared.allUsers[uid]?.username ?? "unknown"
+            let token = "@" + uname
+            ranges.append(NSRange(location: out.length, length: (token as NSString).length))
+            out.append(token)
+            last = full.location + full.length
+        }
+        out.append(ns.substring(with: NSRange(location: last, length: ns.length - last)))
+        return (out as String, ranges)
     }
 
     private func loadImage(_ att: StoatAttachment) {

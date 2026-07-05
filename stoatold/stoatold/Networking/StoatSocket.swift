@@ -20,6 +20,7 @@ class StoatSocket: NSObject, StreamDelegate {
     private(set) var unreadChannelIds: Set<String> = []  // channels with pending unreads
     var onNewMessage: ((String) -> Void)?                 // called with channelId on new msg
     var onNewChannel: (() -> Void)?                       // called when a new DM channel is cached
+    var onUnreadsChanged: (() -> Void)?                   // called after /sync/unreads recomputes unreads
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     var onReady:      (() -> Void)?
@@ -133,6 +134,36 @@ class StoatSocket: NSObject, StreamDelegate {
     func updateBadge() {
         let count = unreadChannelIds.count + pendingFriendRequests.count
         UIApplication.shared.applicationIconBadgeNumber = count
+    }
+
+    // Seed unread state at launch from the server's persisted read receipts.
+    // A channel is unread when its last_message_id is newer (ULIDs sort lexicographically
+    // by time) than the last_id we've read. Channels with no read record are left alone
+    // to avoid flagging every never-opened channel on first launch.
+    private func fetchUnreads() {
+        guard let tok = token else { return }
+        HTTPClient.request("\(APIClient.baseURL)/sync/unreads", method: "GET",
+                           headers: ["x-session-token": tok]) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+            else { return }
+            var lastRead: [String: String] = [:]
+            for u in arr {
+                if let idObj = u["_id"] as? [String: Any],
+                   let chId  = idObj["channel"] as? String {
+                    lastRead[chId] = u["last_id"] as? String
+                }
+            }
+            for (chId, ch) in self.allChannels {
+                guard ch.isText || ch.isDirect, chId != self.activeChannelId,
+                      let lastMsg = ch.lastMessageId else { continue }
+                if let readId = lastRead[chId], lastMsg > readId {
+                    self.unreadChannelIds.insert(chId)
+                }
+            }
+            self.updateBadge()
+            self.onUnreadsChanged?()
+        }
     }
 
     private func fetchAndCacheChannel(_ id: String) {
@@ -397,6 +428,7 @@ class StoatSocket: NSObject, StreamDelegate {
             reconnectDelay = 3  // reset backoff on successful connection
             onReady?()
             updateBadge()
+            fetchUnreads()   // seed unread dots from server-persisted read state
             StoatDebug.log("socket: onReady returned")
         } else if type == "Message" {
             if let chId = json["channel"] as? String {

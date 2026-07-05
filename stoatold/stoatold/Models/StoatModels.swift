@@ -27,6 +27,7 @@ struct StoatChannel {
     let type:       String   // "TextChannel" | "VoiceChannel" | "DirectMessage" | "Group"
     let serverId:   String?
     let recipients: [String]
+    let lastMessageId: String?   // ULID of the last message — used for unread detection
 
     var isText:   Bool { return type == "TextChannel"  }
     var isVoice:  Bool { return type == "VoiceChannel" }
@@ -47,8 +48,10 @@ struct StoatChannel {
         let type    = hasVoice ? "VoiceChannel" : rawType
         let serverId   = dict["server"]       as? String
         let recipients = dict["recipients"]   as? [String] ?? []
+        let lastMessageId = dict["last_message_id"] as? String
         return StoatChannel(id: id, name: name, type: type,
-                            serverId: serverId, recipients: recipients)
+                            serverId: serverId, recipients: recipients,
+                            lastMessageId: lastMessageId)
     }
 }
 

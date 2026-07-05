@@ -53,11 +53,17 @@ class ServerListVC: UIViewController, UIAlertViewDelegate {
                 self?.tableView.reloadData()  // refresh server unread dots
             }
         }
+        // /sync/unreads resolves after Ready — refresh dots + DM badge when it lands
+        StoatSocket.shared.onUnreadsChanged = { [weak self] in
+            self?.tableView.reloadData()
+            self?.updateDMsBadge()
+        }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         StoatSocket.shared.onNewMessage = nil
+        StoatSocket.shared.onUnreadsChanged = nil
     }
 
     // MARK: - UI
