@@ -16,6 +16,10 @@ class StoatSocket: NSObject, StreamDelegate {
     var pendingFriendRequests: [StoatUser] { return allUsers.values.filter { $0.relationship == "Incoming" } }
     private(set) var currentUser: StoatUser?
     private(set) var allUsers: [String: StoatUser] = [:]
+    // Server-scoped member nicknames: serverId → (userId → nickname). Populated when a channel
+    // is opened (mirrors the member list) so the chat thread shows the server rename, not the
+    // global username.
+    private(set) var serverNicknames: [String: [String: String]] = [:]
     var activeChannelId: String?                          // set by ChatVC while open
     private(set) var unreadChannelIds: Set<String> = []  // channels with pending unreads
     var onNewMessage: ((String) -> Void)?                 // called with channelId on new msg
@@ -102,6 +106,7 @@ class StoatSocket: NSObject, StreamDelegate {
         handshakeDone = false
         readBuffer.removeAll(); writeBuffer.removeAll(); fragBuffer.removeAll()
         allUsers.removeAll()
+        serverNicknames.removeAll()
         unreadChannelIds.removeAll()
         currentUser = nil
         if !intentional && !reconnectURL.isEmpty {
@@ -129,6 +134,9 @@ class StoatSocket: NSObject, StreamDelegate {
 
     func cacheUser(_ user: StoatUser) { allUsers[user.id] = user }
     func cacheChannel(_ ch: StoatChannel) { allChannels[ch.id] = ch }
+    func cacheServerNickname(serverId: String, userId: String, nickname: String) {
+        serverNicknames[serverId, default: [:]][userId] = nickname
+    }
     func markRead(_ channelId: String) { unreadChannelIds.remove(channelId); updateBadge() }
 
     func updateBadge() {

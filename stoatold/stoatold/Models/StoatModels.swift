@@ -115,6 +115,12 @@ struct StoatMessage {
     let replies:     [String]
 
     var authorName: String {
+        // Server nickname takes priority (mirrors the member list) so a user renamed
+        // for this server shows the rename, not their global username.
+        if let serverId = StoatSocket.shared.allChannels[channelId]?.serverId,
+           let nick = StoatSocket.shared.serverNicknames[serverId]?[authorId] {
+            return nick
+        }
         if let n = displayName { return n }
         if let u = StoatSocket.shared.allUsers[authorId] { return u.username }
         return authorId

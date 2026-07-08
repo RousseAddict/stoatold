@@ -70,6 +70,7 @@ class ChatVC: UIViewController {
             barButtonSystemItem: .search, target: self, action: #selector(openSearch))
         buildUI()
         fetchMessages()
+        fetchServerMembers()   // seed server nicknames so the thread shows server renames
         StoatSocket.shared.onEvent = { [weak self] json in self?.handleEvent(json) }
     }
 
@@ -476,6 +477,35 @@ class ChatVC: UIViewController {
             self.emptyLabel.isHidden = !self.messages.isEmpty
             self.scrollToBottom(animated: false)
             self.resolveUnknownAuthors()
+        }
+    }
+
+    // Fetch this server's members to populate nicknames (mirrors MembersVC), so authorName
+    // shows the server-specific rename instead of the global username. No-op for DMs.
+    private func fetchServerMembers() {
+        guard let serverId = channel.serverId else { return }
+        APIClient.get("/servers/\(serverId)/members") { [weak self] json, err in
+            guard let self = self else { return }
+            if let err = err { StoatDebug.log("chat: members fetch error: \(err)"); return }
+            guard let dict = json as? [String: Any],
+                  let memberList = dict["members"] as? [[String: Any]] else { return }
+            // Cache any embedded users too so unknown authors resolve.
+            if let users = dict["users"] as? [[String: Any]] {
+                for u in users { if let user = StoatUser.from(dict: u) { StoatSocket.shared.cacheUser(user) } }
+            }
+            for mem in memberList {
+                let uid: String
+                if let mid = mem["_id"] as? String {
+                    uid = mid
+                } else if let mid = mem["_id"] as? [String: Any],
+                          let u = mid["user"] as? String {
+                    uid = u
+                } else { continue }
+                if let nick = mem["nickname"] as? String, !nick.isEmpty {
+                    StoatSocket.shared.cacheServerNickname(serverId: serverId, userId: uid, nickname: nick)
+                }
+            }
+            self.tableView.reloadData()
         }
     }
 
