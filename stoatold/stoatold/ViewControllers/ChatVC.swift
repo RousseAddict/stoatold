@@ -41,6 +41,17 @@ class ChatVC: UIViewController {
     private let jumpBtn   = UIButton(type: .custom)
     private var unseenNew = false
 
+    // Search (list-only, current channel)
+    private let searchBar     = UIView()
+    private let searchField   = UITextField()
+    private let searchCancel  = UIButton(type: .custom)
+    private let resultsTable  = UITableView(frame: .zero, style: .plain)
+    private let resultsEmpty  = UILabel()
+    private let searchSpinner = UIActivityIndicatorView(style: .whiteLarge)
+    private var searchResults: [StoatMessage] = []
+    private var searchActive  = false
+    private let searchBarH: CGFloat = 44
+
     private lazy var baseH: CGFloat = UIScreen.main.bounds.height - 64
 
     init(channel: StoatChannel) {
@@ -55,6 +66,8 @@ class ChatVC: UIViewController {
         super.viewDidLoad()
         title = "#\(channel.name)"
         view.backgroundColor = UIColor(red: 0.12, green: 0.12, blue: 0.16, alpha: 1)
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .search, target: self, action: #selector(openSearch))
         buildUI()
         fetchMessages()
         StoatSocket.shared.onEvent = { [weak self] json in self?.handleEvent(json) }
@@ -216,6 +229,148 @@ class ChatVC: UIViewController {
         jumpBtn.addTarget(self, action: #selector(jumpTapped), for: .touchUpInside)
         view.addSubview(jumpBtn)
         layoutJumpButton()
+
+        buildSearchUI()
+    }
+
+    private func buildSearchUI() {
+        let w = UIScreen.main.bounds.width
+        let h = baseH
+
+        // Results table fills the area below the search bar; hidden until searching.
+        resultsTable.frame = CGRect(x: 0, y: searchBarH, width: w, height: h - searchBarH)
+        resultsTable.backgroundColor = UIColor(red: 0.12, green: 0.12, blue: 0.16, alpha: 1)
+        resultsTable.separatorStyle = .none
+        resultsTable.dataSource = self
+        resultsTable.delegate   = self
+        resultsTable.register(MessageCell.self, forCellReuseIdentifier: "msg")
+        resultsTable.isHidden = true
+        view.addSubview(resultsTable)
+
+        // Tap anywhere in the results area dismisses the keyboard (cell taps still work).
+        let searchTap = UITapGestureRecognizer(target: self, action: #selector(dismissSearchKeyboard))
+        searchTap.cancelsTouchesInView = false
+        resultsTable.addGestureRecognizer(searchTap)
+
+        resultsEmpty.backgroundColor = .clear
+        resultsEmpty.text = "No results"
+        resultsEmpty.textColor = UIColor(white: 0.4, alpha: 1)
+        resultsEmpty.font = UIFont.systemFont(ofSize: 15)
+        resultsEmpty.textAlignment = .center
+        resultsEmpty.frame = CGRect(x: 0, y: (h - searchBarH) / 3, width: w, height: 30)
+        resultsEmpty.isHidden = true
+        view.addSubview(resultsEmpty)
+
+        // Search bar overlay pinned to the top; hidden until the magnifier is tapped.
+        searchBar.backgroundColor = UIColor(red: 0.14, green: 0.14, blue: 0.18, alpha: 1)
+        searchBar.frame = CGRect(x: 0, y: 0, width: w, height: searchBarH)
+        searchBar.isHidden = true
+
+        let sep = UIView(frame: CGRect(x: 0, y: searchBarH - 1, width: w, height: 1))
+        sep.backgroundColor = UIColor(white: 1, alpha: 0.09)
+        searchBar.addSubview(sep)
+
+        let cancelW: CGFloat = 64
+        searchField.backgroundColor = UIColor(red: 0.20, green: 0.20, blue: 0.26, alpha: 1)
+        searchField.textColor = .white
+        searchField.layer.cornerRadius = 8
+        searchField.layer.masksToBounds = true
+        searchField.contentVerticalAlignment = .center
+        let lpad = UIView(frame: CGRect(x: 0, y: 0, width: 10, height: 32))
+        searchField.leftView = lpad; searchField.leftViewMode = .always
+        searchField.frame = CGRect(x: 10, y: 6, width: w - 20 - cancelW, height: 32)
+        searchField.returnKeyType = .search
+        searchField.placeholder = "Search #\(channel.name)"
+        searchField.delegate = self
+        searchBar.addSubview(searchField)
+
+        searchCancel.setTitle("Cancel", for: .normal)
+        searchCancel.setTitleColor(UIColor(red: 0.55, green: 0.70, blue: 0.98, alpha: 1), for: .normal)
+        searchCancel.titleLabel?.font = UIFont.systemFont(ofSize: 15)
+        searchCancel.frame = CGRect(x: w - cancelW - 4, y: 6, width: cancelW, height: 32)
+        searchCancel.addTarget(self, action: #selector(closeSearch), for: .touchUpInside)
+        searchBar.addSubview(searchCancel)
+
+        view.addSubview(searchBar)
+
+        // Spinner sits just below the search bar so the keyboard never covers it.
+        searchSpinner.hidesWhenStopped = true
+        searchSpinner.center = CGPoint(x: w / 2, y: searchBarH + 40)
+        view.addSubview(searchSpinner)
+    }
+
+    @objc private func dismissSearchKeyboard() { searchField.resignFirstResponder() }
+
+    @objc private func openSearch() {
+        searchActive = true
+        searchResults = []
+        resultsEmpty.isHidden = true
+        resultsTable.reloadData()
+        searchBar.isHidden = false
+        resultsTable.isHidden = false
+        view.bringSubviewToFront(resultsTable)
+        view.bringSubviewToFront(resultsEmpty)
+        view.bringSubviewToFront(searchBar)
+        view.bringSubviewToFront(searchSpinner)
+        searchField.becomeFirstResponder()
+    }
+
+    @objc private func closeSearch() {
+        searchActive = false
+        searchSpinner.stopAnimating()
+        searchField.resignFirstResponder()
+        searchField.text = ""
+        searchBar.isHidden = true
+        resultsTable.isHidden = true
+        resultsEmpty.isHidden = true
+        searchResults = []
+        resultsTable.reloadData()
+    }
+
+    private func performSearch() {
+        let query = (searchField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count >= 1 && query.count <= 64 else { return }
+        guard let token = APIClient.sessionToken,
+              let body  = try? JSONSerialization.data(withJSONObject: [
+                  "query": query,
+                  "limit": 50,
+                  "sort": "Relevance",
+                  "include_users": true,
+              ]) else { return }
+        // Dismiss the keyboard and show the spinner (clear old results so it stands alone).
+        searchField.resignFirstResponder()
+        searchResults = []
+        resultsEmpty.isHidden = true
+        resultsTable.reloadData()
+        searchSpinner.startAnimating()
+        view.bringSubviewToFront(searchSpinner)
+        HTTPClient.request("\(APIClient.baseURL)/channels/\(channel.id)/search",
+                           method: "POST", headers: ["x-session-token": token], body: body) { [weak self] data, status, err in
+            guard let self = self else { return }
+            self.searchSpinner.stopAnimating()
+            if let err = err { StoatDebug.log("search: error \(err.localizedDescription)"); return }
+            guard let data = data,
+                  let obj  = try? JSONSerialization.jsonObject(with: data) else {
+                StoatDebug.log("search: bad response status=\(status)")
+                return
+            }
+            // Response is either a bare [Message] or { messages, users, members }.
+            var rawMessages: [[String: Any]] = []
+            if let arr = obj as? [[String: Any]] {
+                rawMessages = arr
+            } else if let dict = obj as? [String: Any] {
+                rawMessages = dict["messages"] as? [[String: Any]] ?? []
+                if let users = dict["users"] as? [[String: Any]] {
+                    for u in users { if let user = StoatUser.from(dict: u) { StoatSocket.shared.cacheUser(user) } }
+                }
+            }
+            self.searchResults = rawMessages.compactMap { StoatMessage.from(dict: $0) }
+            self.resultsEmpty.isHidden = !self.searchResults.isEmpty
+            self.resultsTable.reloadData()
+            if !self.searchResults.isEmpty {
+                self.resultsTable.setContentOffset(.zero, animated: false)
+            }
+        }
     }
 
     private func layoutJumpButton() {
@@ -791,7 +946,10 @@ class ChatVC: UIViewController {
 // MARK: - UITextFieldDelegate
 
 extension ChatVC: UITextFieldDelegate {
-    func textFieldShouldReturn(_ textField: UITextField) -> Bool { sendTapped(); return false }
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        if textField === searchField { performSearch(); return false }
+        sendTapped(); return false
+    }
 }
 
 // MARK: - UIAlertViewDelegate (delete confirmation)
@@ -809,11 +967,25 @@ extension ChatVC: UIAlertViewDelegate {
 extension ChatVC: UITableViewDataSource, UITableViewDelegate {
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return messages.count
+        return tableView === resultsTable ? searchResults.count : messages.count
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "msg", for: indexPath) as! MessageCell
+
+        // Results table: read-only cells (no grouping, no swipe/menu actions).
+        if tableView === resultsTable {
+            let msg = searchResults[indexPath.row]
+            cell.configure(with: msg, grouped: false, separatorText: nil, replyPreview: nil)
+            cell.isOwn = false
+            cell.onEdit = nil; cell.onDelete = nil; cell.onReply = nil
+            cell.onImageTap = { [weak self] img in
+                let viewer = ImageViewerVC(image: img)
+                self?.navigationController?.pushViewController(viewer, animated: true)
+            }
+            return cell
+        }
+
         let msg = messages[indexPath.row]
         cell.configure(with: msg,
                        grouped: isGrouped(at: indexPath.row),
@@ -834,6 +1006,10 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
     }
 
     func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
+        if tableView === resultsTable {
+            let msg = searchResults[indexPath.row]
+            return ChatVC.rowHeight(for: msg, grouped: false, separator: false, hasReply: false)
+        }
         let msg = messages[indexPath.row]
         return ChatVC.rowHeight(for: msg,
                                 grouped: isGrouped(at: indexPath.row),
@@ -842,6 +1018,7 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        if scrollView === resultsTable { return }
         updateJumpButton()
     }
 
