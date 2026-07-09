@@ -41,6 +41,15 @@ class ChatVC: UIViewController {
     private let jumpBtn   = UIButton(type: .custom)
     private var unseenNew = false
 
+    // Jump-to-message (from search) — "jumped" state = showing a window that is NOT the live tail
+    private let loadNewerBtn      = UIButton(type: .custom)
+    private var atLiveTail        = true
+    private var isLoadingNewer    = false
+    private var highlightMessageId: String?
+    private var highlightTimer:    Timer?
+    private let normalCellBg    = UIColor(red: 0.12, green: 0.12, blue: 0.16, alpha: 1)
+    private let highlightCellBg = UIColor(red: 0.18, green: 0.22, blue: 0.34, alpha: 1)
+
     // Search (list-only, current channel)
     private let searchBar     = UIView()
     private let searchField   = UITextField()
@@ -93,6 +102,8 @@ class ChatVC: UIViewController {
         for (_, t) in typingTimers { t.invalidate() }
         typingTimers.removeAll()
         typingUserIds.removeAll()
+        highlightTimer?.invalidate()
+        highlightTimer = nil
     }
 
     // MARK: - Build UI
@@ -180,6 +191,13 @@ class ChatVC: UIViewController {
         loadMoreBtn.frame = CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 40)
         loadMoreBtn.addTarget(self, action: #selector(loadOlderMessages), for: .touchUpInside)
         tableView.tableHeaderView = loadMoreBtn
+
+        // Footer used only while jumped (not at the live tail) to walk back toward the present.
+        loadNewerBtn.setTitle("Load newer messages", for: .normal)
+        loadNewerBtn.setTitleColor(UIColor(white: 0.55, alpha: 1), for: .normal)
+        loadNewerBtn.titleLabel?.font = UIFont.systemFont(ofSize: 13)
+        loadNewerBtn.frame = CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: 40)
+        loadNewerBtn.addTarget(self, action: #selector(loadNewerMessages), for: .touchUpInside)
 
         typingLabel.backgroundColor = UIColor(red: 0.12, green: 0.12, blue: 0.16, alpha: 0.92)
         typingLabel.textColor = UIColor(white: 0.55, alpha: 1)
@@ -390,6 +408,13 @@ class ChatVC: UIViewController {
     }
 
     private func updateJumpButton() {
+        // While jumped (viewing an older window), always offer a return to the live tail.
+        if !atLiveTail {
+            jumpBtn.setTitle("\u{2193} Latest", for: .normal)
+            jumpBtn.isHidden = false
+            layoutJumpButton()
+            return
+        }
         if isNearBottom() {
             unseenNew = false
             jumpBtn.isHidden = true
@@ -401,9 +426,128 @@ class ChatVC: UIViewController {
     }
 
     @objc private func jumpTapped() {
+        if !atLiveTail { returnToLatest(); return }
         unseenNew = false
         jumpBtn.isHidden = true
         scrollToBottom()
+    }
+
+    // MARK: - Jump to a specific message (from search)
+
+    private func jumpToMessage(_ id: String) {
+        if let idx = messages.firstIndex(where: { $0.id == id }) {
+            scrollAndHighlight(row: idx, id: id, animated: true)
+        } else {
+            fetchNearby(id)
+        }
+    }
+
+    // Load a window of messages centred on `id` and replace the visible thread with it.
+    // This puts us in "jumped" state (not the live tail) until the user returns to latest.
+    private func fetchNearby(_ id: String) {
+        APIClient.get("/channels/\(channel.id)/messages?limit=50&nearby=\(id)") { [weak self] json, err in
+            guard let self = self else { return }
+            if let err = err { StoatDebug.log("chat: nearby error: \(err)"); return }
+            // nearby normally returns a bare array; tolerate {messages,users} too.
+            var raw: [[String: Any]] = []
+            if let arr = json as? [[String: Any]] {
+                raw = arr
+            } else if let dict = json as? [String: Any] {
+                raw = dict["messages"] as? [[String: Any]] ?? []
+                if let users = dict["users"] as? [[String: Any]] {
+                    for u in users { if let user = StoatUser.from(dict: u) { StoatSocket.shared.cacheUser(user) } }
+                }
+            }
+            // ULIDs sort lexicographically by time — don't assume server order.
+            let window = raw.compactMap { StoatMessage.from(dict: $0) }.sorted { $0.id < $1.id }
+            guard !window.isEmpty else { StoatDebug.log("chat: nearby empty"); return }
+            let idx = window.firstIndex(where: { $0.id == id })
+                ?? window.firstIndex(where: { $0.id > id })
+                ?? window.count - 1
+            self.messages = window
+            self.atLiveTail = false
+            self.enterJumpedMode()
+            self.emptyLabel.isHidden = true
+            self.scrollAndHighlight(row: idx, id: window[idx].id == id ? id : "", animated: false)
+            self.resolveUnknownAuthors()
+        }
+    }
+
+    // Reset the header/footer/pill for jumped state, then reload.
+    private func enterJumpedMode() {
+        loadMoreBtn.setTitle("Load older messages", for: .normal)
+        loadMoreBtn.isEnabled = true
+        loadNewerBtn.setTitle("Load newer messages", for: .normal)
+        loadNewerBtn.isEnabled = true
+        tableView.tableFooterView = loadNewerBtn
+        tableView.reloadData()
+        updateJumpButton()
+    }
+
+    // Return to the live tail: reload the latest 50 and drop the jumped-state chrome.
+    @objc private func returnToLatest() {
+        atLiveTail = true
+        unseenNew  = false
+        tableView.tableFooterView = nil
+        loadMoreBtn.setTitle("Load older messages", for: .normal)
+        loadMoreBtn.isEnabled = true
+        jumpBtn.isHidden = true
+        fetchMessages()   // reloads latest 50 + scrolls to bottom
+    }
+
+    @objc private func loadNewerMessages() {
+        guard !isLoadingNewer, let lastId = messages.last?.id else { return }
+        isLoadingNewer = true
+        loadNewerBtn.setTitle("Loading…", for: .normal)
+        APIClient.get("/channels/\(channel.id)/messages?limit=50&after=\(lastId)&sort=Oldest") { [weak self] json, err in
+            guard let self = self else { return }
+            self.isLoadingNewer = false
+            self.loadNewerBtn.setTitle("Load newer messages", for: .normal)
+            var newer: [StoatMessage] = []
+            if let arr = json as? [[String: Any]] {
+                newer = arr.compactMap { StoatMessage.from(dict: $0) }
+            }
+            newer.sort { $0.id < $1.id }
+            let existing = Set(self.messages.map { $0.id })
+            newer = newer.filter { !existing.contains($0.id) }
+            if newer.isEmpty {
+                // Caught up to the present — resume live behaviour.
+                self.atLiveTail = true
+                self.tableView.tableFooterView = nil
+                self.updateJumpButton()
+                return
+            }
+            self.messages += newer
+            self.tableView.reloadData()
+            self.resolveUnknownAuthors()
+            if newer.count < 50 {
+                self.atLiveTail = true
+                self.tableView.tableFooterView = nil
+                self.updateJumpButton()
+            }
+        }
+    }
+
+    private func scrollAndHighlight(row: Int, id: String, animated: Bool) {
+        guard row >= 0 && row < messages.count else { return }
+        // Apply the tint first (reloadData preserves contentSize since bg-only), then scroll.
+        highlightTimer?.invalidate()
+        highlightMessageId = id.isEmpty ? nil : id
+        tableView.reloadData()
+        tableView.scrollToRow(at: IndexPath(row: row, section: 0), at: .middle, animated: animated)
+        guard highlightMessageId != nil else { return }
+        let t = Timer(timeInterval: 1.6, target: self, selector: #selector(clearHighlight),
+                      userInfo: nil, repeats: false)
+        RunLoop.main.add(t, forMode: .common)
+        highlightTimer = t
+    }
+
+    @objc private func clearHighlight() {
+        highlightTimer?.invalidate()
+        highlightTimer = nil
+        guard highlightMessageId != nil else { return }
+        highlightMessageId = nil
+        tableView.reloadData()
     }
 
     private func layoutTypingLabel() {
@@ -547,6 +691,13 @@ class ChatVC: UIViewController {
         }
         guard !messages.contains(where: { $0.id == msg.id }) else { return }
         removeTyping(msg.authorId)   // sending a message implicitly stops typing
+        // When viewing a jumped window (not the live tail), don't append live messages —
+        // they belong after the tail, not after this window. Surface via the "↓ Latest" pill.
+        guard atLiveTail else {
+            unseenNew = true
+            updateJumpButton()
+            return
+        }
         let wasNearBottom = isNearBottom() || msg.authorId == StoatSocket.shared.currentUser?.id
         messages.append(msg)
         emptyLabel.isHidden = true
@@ -901,8 +1052,11 @@ class ChatVC: UIViewController {
             guard let self = self,
                   let data = data,
                   let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let msg  = StoatMessage.from(dict: dict),
-                  !self.messages.contains(where: { $0.id == msg.id }) else { return }
+                  let msg  = StoatMessage.from(dict: dict) else { return }
+            // If we were viewing a jumped window, sending returns us to the live tail
+            // (the new message lives there, not in this window).
+            guard self.atLiveTail else { self.returnToLatest(); return }
+            guard !self.messages.contains(where: { $0.id == msg.id }) else { return }
             self.messages.append(msg)
             self.tableView.insertRows(at: [IndexPath(row: self.messages.count - 1, section: 0)], with: .none)
             self.scrollToBottom()
@@ -1007,6 +1161,7 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
         if tableView === resultsTable {
             let msg = searchResults[indexPath.row]
             cell.configure(with: msg, grouped: false, separatorText: nil, replyPreview: nil)
+            cell.backgroundColor = normalCellBg
             cell.isOwn = false
             cell.onEdit = nil; cell.onDelete = nil; cell.onReply = nil
             cell.onImageTap = { [weak self] img in
@@ -1021,6 +1176,8 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
                        grouped: isGrouped(at: indexPath.row),
                        separatorText: daySeparatorText(at: indexPath.row),
                        replyPreview: replyDisplay(for: msg))
+        // Highlight tint for a jumped-to message (set BOTH branches so cell reuse can't leak it).
+        cell.backgroundColor = (msg.id == highlightMessageId) ? highlightCellBg : normalCellBg
         cell.isOwn = (msg.authorId == StoatSocket.shared.currentUser?.id)
         let mid = msg.id, content = msg.content
         let replyAuthor  = msg.authorName
@@ -1045,6 +1202,15 @@ extension ChatVC: UITableViewDataSource, UITableViewDelegate {
                                 grouped: isGrouped(at: indexPath.row),
                                 separator: daySeparatorText(at: indexPath.row) != nil,
                                 hasReply: replyDisplay(for: msg) != nil)
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: false)
+        // Only the search results table is tappable — jump to that message in the main thread.
+        guard tableView === resultsTable, indexPath.row < searchResults.count else { return }
+        let id = searchResults[indexPath.row].id
+        closeSearch()
+        jumpToMessage(id)
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
