@@ -1540,13 +1540,13 @@ private class MessageCell: UITableViewCell {
 
     private func loadImage(_ att: StoatAttachment) {
         let aid = att.id
-        var hdrs: [String: String] = [:]
-        if let tok = APIClient.sessionToken { hdrs["x-session-token"] = tok }
         StoatDebug.log("loadImage: url=\(att.url)")
-        HTTPClient.request(att.url, headers: hdrs) { [weak self] data, status, err in
-            StoatDebug.log("loadImage: status=\(status) dataLen=\(data?.count ?? -1)")
-            guard let data = data, let img = UIImage(data: data) else {
-                StoatDebug.log("loadImage: bad data aid=\(aid) status=\(status)")
+        // CDN re-encodes every attachment (PNG/JPEG/etc.) to WebP, which UIImage can't decode
+        // on iOS 6/7 — plain HTTPClient.request + UIImage(data:) silently returns a blank image.
+        // CDNImage does the owsl TLS bridge (GCM) + libwebp fallback, same as icons/avatars.
+        CDNImage.load(att.url) { [weak self] img in
+            guard let img = img else {
+                StoatDebug.log("loadImage: decode failed aid=\(aid)")
                 return
             }
             // Cache before cell-reuse check so scrolling back shows the image immediately

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <errno.h>
 
 struct OWSLContext {
     char             host[512];
@@ -96,21 +97,30 @@ int owsl_connect(OWSLContext *ctx) {
         return -1;
     }
 
-    ctx->sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (ctx->sockfd < 0) {
-        freeaddrinfo(res);
-        snprintf(ctx->last_error, sizeof(ctx->last_error), "socket() failed");
-        return -2;
-    }
+    /* Hosts can resolve to multiple addresses (e.g. both A and AAAA records).
+     * A single address family being unreachable on the current network (broken/
+     * unrouted IPv6 is common) must not fail the whole connect — try every
+     * candidate in order and use the first one that actually connects. */
+    int lastSockErrno = 0;
+    for (struct addrinfo *cur = res; cur != NULL; cur = cur->ai_next) {
+        ctx->sockfd = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+        if (ctx->sockfd < 0) { lastSockErrno = errno; continue; }
 
-    if (connect(ctx->sockfd, res->ai_addr, res->ai_addrlen) != 0) {
-        freeaddrinfo(res);
-        close(ctx->sockfd); ctx->sockfd = -1;
-        snprintf(ctx->last_error, sizeof(ctx->last_error),
-                 "connect() failed to %s:%d", ctx->host, ctx->port);
-        return -3;
+        if (connect(ctx->sockfd, cur->ai_addr, cur->ai_addrlen) == 0) {
+            break;   /* connected */
+        }
+        lastSockErrno = errno;
+        close(ctx->sockfd);
+        ctx->sockfd = -1;
     }
     freeaddrinfo(res);
+
+    if (ctx->sockfd < 0) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error),
+                 "connect() failed to %s:%d (%s)", ctx->host, ctx->port,
+                 strerror(lastSockErrno));
+        return -3;
+    }
 
     /* ── TLS ─────────────────────────────────────────────────────────────── */
     ctx->ssl_ctx = SSL_CTX_new(TLS_client_method());
